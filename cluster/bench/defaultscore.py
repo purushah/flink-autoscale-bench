@@ -1,6 +1,7 @@
 """The cluster signal campaign at the operator's default time settings (plan entry of 2026-11-22 09:06 PST):
 per run and job what the predictions D1 to D6 need, and their score.
-   python3 defaultscore.py <campaign dir> [scenario]          default scenario: surge_default
+   python3 defaultscore.py <campaign dir> [scenario] [--without N[,N]]     default scenario: surge_default
+--without leaves out the runs with these numbers (runs that the cluster disturbed).
 Per job-run, from the harness files: the orders for Aggregate after the rise (seconds after it and the
 size asked for, from the size the autoscaler asked for in samples.csv), the seconds after the rise at
 which Aggregate first runs with the largest size of the run (16 at scale 2), the size it runs with 45
@@ -71,11 +72,18 @@ def interval(x):
 
 
 def main():
-    camp = sys.argv[1]
-    scenario = sys.argv[2] if len(sys.argv) > 2 else "surge_default"
+    argv, without = sys.argv[1:], set()
+    if "--without" in argv:
+        i = argv.index("--without")
+        without = {int(x) for x in argv[i + 1].split(",")}
+        argv = argv[:i] + argv[i + 2:]
+    camp = argv[0]
+    scenario = argv[1] if len(argv) > 1 else "surge_default"
     dd = json.load(open(os.path.join(camp, "datadog.json"))).get("runs", {}) if os.path.exists(os.path.join(camp, "datadog.json")) else {}
     reps = sorted(int(x[3:]) for x in os.listdir(os.path.join(camp, scenario)) if x.startswith("rep") and x[3:].isdigit()
-                  and os.path.exists(os.path.join(camp, scenario, x, "meta.json")))
+                  and os.path.exists(os.path.join(camp, scenario, x, "meta.json")) and int(x[3:]) not in without)
+    if without:
+        print(f"left out: runs {sorted(without)}")
     runs = {}
     for rep in reps:
         m, out = one(os.path.join(camp, scenario, f"rep{rep}"))

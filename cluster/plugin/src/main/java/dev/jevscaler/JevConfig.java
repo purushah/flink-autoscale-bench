@@ -162,6 +162,15 @@ public final class JevConfig {
     /** The share by which the newest interval must exceed the window (key {@code lag.step-margin}). */
     public double lagStepMargin = 0.2;
 
+    /**
+     * At the first step of a rise the rate between two readings of the end offsets half a second
+     * apart was up to 2.6 times the load on a cluster (ISSUES.md #141). When that rate would be the
+     * demand, the end offsets are read once more this many seconds after the first reading, and the
+     * rate over that longer span is used (key {@code lag.step-confirm-seconds}; 0 keeps the short
+     * reading). The wait is on the reconcile thread, once per rise.
+     */
+    public double lagStepConfirmSeconds = 2.0;
+
     public boolean lagFromBroker() {
         return "broker".equalsIgnoreCase(lagSource);
     }
@@ -204,6 +213,16 @@ public final class JevConfig {
      * not added to the capped projection.
      */
     public double windowCapMargin = 0.1;
+
+    /**
+     * With a scale-down window: a scale-down keeps what the highest demand of the window plus
+     * {@link #windowCapMargin} needs, not what that demand alone needs (key {@code
+     * scale-down.window-keeps-margin}). A demand up to the margin above the level still counts as
+     * the level, and one reading of a subtask's capacity moves by a few percent. A size that just
+     * fits the level at one reading is too small at the next, and the scale-down is undone when
+     * the load returns (ISSUES.md #119, second cause).
+     */
+    public boolean windowKeepsMargin = false;
 
     /**
      * When positive, a plan that only scales down is dropped unless it frees at least this many
@@ -263,6 +282,10 @@ public final class JevConfig {
         c.windowCapsTrend =
                 "true".equalsIgnoreCase(str(lookup, "scale-down.window-caps-trend", String.valueOf(c.windowCapsTrend)));
         c.windowCapMargin = Math.max(0, num(lookup, "scale-down.window-cap-margin", c.windowCapMargin));
+        c.windowKeepsMargin =
+                "true"
+                        .equalsIgnoreCase(
+                                str(lookup, "scale-down.window-keeps-margin", String.valueOf(c.windowKeepsMargin)));
         c.scaleDownMinSlots = Math.max(0, (int) num(lookup, "scale-down.min-slots", c.scaleDownMinSlots));
         c.requestTimeout = dur(lookup, "request-timeout", c.requestTimeout);
         c.maxRetries = (int) num(lookup, "max-retries", c.maxRetries);
@@ -291,6 +314,8 @@ public final class JevConfig {
         c.lagAuth = str(lookup, "lag.auth", c.lagAuth).trim();
         c.lagStepAware = "true".equalsIgnoreCase(str(lookup, "lag.step-aware", String.valueOf(c.lagStepAware)));
         c.lagStepMargin = Math.max(0, num(lookup, "lag.step-margin", c.lagStepMargin));
+        c.lagStepConfirmSeconds =
+                Math.max(0, Math.min(10, num(lookup, "lag.step-confirm-seconds", c.lagStepConfirmSeconds)));
         c.catchUpSeconds = (int) num(lookup, "catch-up-seconds", c.catchUpSeconds);
         c.restartSeconds = (int) num(lookup, "restart-seconds", c.restartSeconds);
         c.trendWindowSeconds = Math.max(30, (int) num(lookup, "trend-window-seconds", c.trendWindowSeconds));

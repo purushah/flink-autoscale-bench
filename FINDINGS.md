@@ -1130,6 +1130,57 @@ Reproduce: `python3 cluster/bench/sigsum.py results-cluster/signal surge_long`,
 `python3 cluster/bench/signalcheck.py --min 20000 --by-size results-cluster/signal/surge_long/rep*`,
 `python3 cluster/bench/stepreplay.py results-cluster/signal/surge_long/rep*`.
 
+### The same at the operator's default time settings (5 runs, exploratory by the plan's rule, no test)
+
+Plan entry of 22 Nov 09:06 PST with the amendment of 14:30 PST; checks and outcome entries of 23 Nov
+12:12 and 12:14 PST. The operator's defaults for the five time settings the other campaigns shorten
+(metric window 15 minutes, stabilization 5 minutes, catch-up 30 minutes, restart time 5 minutes,
+scale-down interval 1 hour), 400 to 4,800 records/s for 90 minutes after a warm-up of 21 minutes, the
+same four built-in jobs side by side. Up to six runs were planned until 23 Nov 12:00 PST; five are
+complete, so there is no test. In run 1 the cluster's node autoscaler evicted a TaskManager of every job
+227 s before the load fell; the run is kept and marked.
+
+| | default signal | broker-side signal | difference [95%] | lower in | slots held |
+|---|---|---|---|---|---|
+| shipped band | 4,183 s | 3,179 s | -1,004 s [-1,101, -907], 24% | 5 of 5 | 12.3 / 13.0 |
+| band at the target | 3,971 s | 3,317 s | -654 s [-799, -510], 16% | 5 of 5 | 12.6 / 13.1 |
+
+Without run 1: -991 s [-1,125, -857] and -646 s [-857, -435], 4 of 4 each. By run with the shipped band:
+-1,055, -901, -972, -988, -1,104 s (22 to 26%). No job was still over the limit at the end.
+
+What happened in every run. With either signal the rule took two steps: 2 to 4 subtasks and then to
+the maximum of 16 with the shipped band, 2 to 3 and then 16 with the band at the target. With the
+broker-side signal and the shipped band the first order came 93 to 101 s after the rise and the second
+1,308 to 1,316 s after it; with the default signal they came after 426 to 488 s and after 1,646 to
+1,708 s. The load was covered 374 s [341, 407] sooner. So the signal makes the rule act about six
+minutes sooner, twice; the step is the same, and after it the rule cannot decide for 20 minutes. Both
+jobs were over the limit for most of the 90 minutes. The second order of the broker-side jobs was cut by
+the maximum (the formula asked for 28 to 31 subtasks in the six of ten job-runs whose decision log
+covers that evaluation). `pendingRecords` showed 6 to 8% of the true backlog over the first ten minutes
+in four runs and 15% in one (default signal, shipped band). Not planned, and the reason why the
+default-signal job needed no third step: while it ran with 2 subtasks its metric showed 6 to 7% of the
+backlog, and once it ran with 4 it showed 71 to 73% (52 to 81% by sample), in all five runs. Its second
+order was therefore sized on most of a backlog of millions of records and went to the maximum.
+
+Predictions: D1 (lower in every run, by 600 s or more, 20% on average), D2 (first order and time of the
+full size with the broker-side signal), D5 (more slots) and D6 (band at the target) held. D4 held in 4
+of 5 runs (15% where under 15% was predicted). D3 failed in all five: its first part held (first order
+after more than 300 s), its second did not; we had worked out three steps for the default-signal job
+and it took two. The clause against the finding is not met.
+
+Not planned: with the broker-side signal the band at the target was over the limit for 138 s
+[117, 159] longer than the shipped band, in 5 of 5 runs (it acts 45 s sooner and orders 3 subtasks where
+the shipped band orders 4); with the default signal it was 212 s [10, 414] shorter, in 4 of 5.
+
+What this is not. Five runs on one cluster with one load shape and no test: it supports the sign and
+the rough size at the default settings. The demand that follows a jump (section 16) was not run at these
+settings; it is the remedy for the small first step that costs both jobs most of their time here.
+
+Reproduce: `python3 cluster/bench/defaultscore.py results-cluster/defaultwin` (add `--without 1`),
+`python3 cluster/bench/sigsum.py results-cluster/defaultwin surge_default --no-test`,
+`python3 cluster/bench/disturbed_cluster.py results-cluster/defaultwin surge_default`,
+`python3 cluster/bench/readfail.py results-cluster/defaultwin/surge_default/rep*` (from `cluster/bench`).
+
 ## 14. Five short scenarios: no planned test separates the policy from the built-in rule or the models from the policy (main campaign, 80 runs)
 
 Five scenarios with a measured phase of 6 or 7 minutes (ramp, spike, drop, skew, slow-down), four
@@ -1297,3 +1348,279 @@ when the laptop is in other use.
 
 The findings of the pilot runs (first version of the plugin and benchmark, 2026-11-16 and 17) are in
 [FINDINGS-pilot.md](FINDINGS-pilot.md). They are superseded and not valid for comparing controllers.
+
+## 15. A cap on the trend projection keeps the policy from undoing its scale-down when a load returns, but two of five runs still undid a later, deeper scale-down (cluster test B, scale 2, 5 runs)
+
+Section 10 showed the plugin's policy running out of phase with a load that falls and comes back within
+minutes: it scaled down in the low phase and up again when the load returned, with or without a look-back
+of ten minutes. The look-back alone did not help because the first reading after a restart is compared
+with the last one before it, and the trend projection then doubles the demand (`ISSUES.md` #119). The
+change tested here (`scale-down.window-caps-trend`, operator image `cluster10`): while the demand is not
+more than 10% above the highest demand the look-back window saw more than 90 s ago, the projection is at
+most the higher of that level and the demand.
+
+Test, registered before the runs (`paper/outline.md`, 21 Nov 16:53 and 22 Nov 01:26 PST): the on-off load
+of section 10 (800 and 3,200 records/s at scale 2, two minutes each), five jobs side by side, five runs
+on 23 Nov between 04:53 and 07:22 UTC. `builtin+max70`; `rule`, the policy; `rule+b`, the policy with the
+look-back; `rule+c`, look-back, cap, and a scale-down has to free two slots; `llm+c`, the LLM with the
+history in its prompt and the same two-slot rule. No run was invalid, and none was disturbed by the
+cluster (`cluster/bench/disturbed_cluster.py`, run on each before its numbers were read).
+
+| from the second high phase on | `builtin+max70` | `rule` | `rule+b` | `rule+c` | `llm+c` |
+|---|---|---|---|---|---|
+| restarts per run | 4, 3, 3, 4, 3 | 7, 7, 8, 7, 7 | 8, 7, 8, 7, 7 | 1, 4, 2, 2, 2 | 4, 5, 6, 4, 3 |
+| scale-downs undone within 5 min, mean | 0.6 | 2.8 | 3.0 | 0.2 | 1.8 |
+| seconds over the limit, mean (harness) | 24.2 | 30.0 | 25.2 | 6.4 | 13.8 |
+| whole run: seconds over the limit, mean (monitoring service) | 155.0 | 154.8 | 151.2 | 138.0 | 137.6 |
+| whole run: slots in use, mean (monitoring service) | 11.88 | 13.15 | 13.35 | 11.58 | 13.59 |
+
+Against the predictions: the projection check held in all 329 evaluations with a demand within the
+margin (B2; without the cap it fails in 36 of 176); the time over the limit was 13 s below the look-back's
+on average, where the plan allowed 20 s above (B3). Not met: "at most 3 restarts in every run" (4 in run
+2, B1); "at least as many slots as the policy" (it used 1.6 fewer in every run, so the cost the plan
+expected did not appear, B4); and "no scale-up at a demand within the margin" (two, B5). Two such
+scale-ups are more than the plan allowed, so by the rule fixed in advance the test counts against the
+change as a complete repair.
+
+The two scale-ups have another cause than the projection. In runs 2, 4 and 5 `rule+c`, holding 12
+subtasks of Aggregate, made a second scale-down to 10 late in the run. At those evaluations the capacity
+estimate of one subtask was 460 to 463 records/s, and the earlier level divided by the target
+utilization and that capacity came to 9.97, 10.00 and 9.99. When the load returned the estimate was 443
+and 432, the same division gave 10.4 and 10.7, and the policy went to 15 (runs 2 and 4; run 5 ended
+first). The estimate at 12 subtasks ranged from 424 to 474 over the runs. A scale-down that is kept for
+an earlier level is sized with one reading of a capacity that moves by 5%, and nothing separates the
+size it picks from the size at which the policy scales up again.
+
+Limits: five runs, one load shape, one cluster, no significance test. The remedy for the second cause
+(a margin on the size a scale-down keeps for an earlier level) is not built.
+
+Reproduce: `python3 cluster/bench/flapsum.py results-cluster/policyfix2/onoff/rep*`,
+`python3 cluster/bench/flaporders.py results-cluster/policyfix2/onoff/rep*`, monitoring extracts in
+`results-cluster/policyfix2/datadog.json`.
+
+
+## 16. With five-minute windows a demand that follows a jump in the load cut the built-in rule's time over the limit from 20 minutes to two and a half (cluster test C, scale 2, 6 runs)
+
+Section 13 ended with a cost of the broker-side signal: the built-in rule sees the true backlog a few
+seconds after the load rises, adds it to a demand that is still the average of a window of old load,
+and orders a small first step. With five-minute windows every job did that and reached its full size
+only 450 to 507 s after the rise (`ISSUES.md` #123). The change tested here (`lag.step-aware`, operator
+image `cluster10`): when the records of the newest interval between two evaluations arrived more than 20%
+faster than the window's average and the backlog grew by more than that share, the source's demand is
+the newest interval's rate, or the rate between two readings of the end offsets within the same cycle
+when that is higher. The demand is never lowered.
+
+Test, registered before the runs (`paper/outline.md`, 21 Nov 21:31 PST): 400, then 4,800 records/s for 40
+minutes at scale 2, five-minute metric window, four jobs side by side with the broker-side signal: the
+built-in rule with the shipped band and with the band at the target, each without and with the option.
+Six runs on 23 Nov, measured windows from 07:32 to 13:14 UTC. No run was invalid, no broker read
+failed, and none was disturbed by the cluster (`cluster/bench/disturbed_cluster.py`, run before any number
+was read).
+
+| per job-run, 6 runs | shipped band | shipped band, option | band at target | band at target, option |
+|---|---|---|---|---|
+| first order for Aggregate after the rise | 3 or 4 | 12 to 16 | 3 | 12 to 16 |
+| seconds from the rise to that order | 24 to 37 | 0.6 to 15.3 | 13 to 24 | 2.5 to 15.6 |
+| seconds until 10 subtasks run | 492 to 520 | 44 to 62 | 483 to 510 | 45 to 62 |
+| scale-ups of Aggregate | 2 | 1 | 2 | 1 |
+| seconds over the limit, mean (monitoring service) | 1,224 | 145 | 1,262 | 145 |
+| slots in use, mean (monitoring service) | 13.27 | 15.20 | 13.33 | 15.20 |
+
+All seven predictions held. The primary one: with the shipped band the job with the option was over
+the limit for fewer seconds in 6 of 6 runs, by 1,049 to 1,104 s (mean -1,078.8 [-1,099.9, -1,057.8];
+exact sign-flip p 0.031, the smallest six pairs can give). With the band at the target: 6 of 6, mean
+-1,117.5. Step lines appeared only on jobs with the option, the last 103 s after the rise. The cost is
+1.9 slots on average over the 48-minute window: the job is at 16 subtasks about seven and a half
+minutes sooner.
+
+A weakness outside the predictions (`ISSUES.md` #141). The reading within a cycle spans about half a
+second. At the first step line of a job-run it did its work: the demand was 0.74 to 1.15 of the load,
+where the newest interval alone was below 0.9 of it in 9 of 12. At the 31 later lines the newest
+interval was within 3% of the load every time, and the reading within the cycle ranged from 0.40 to
+2.26 of it. In run 3 one job took a demand of 10,830 and 10,637 records/s against a load of 4,800.
+Aggregate was already at the job's maximum of 16, so the only effect was six subtasks instead of three
+for the operator after it and one more restart when that was undone. On a job with more room the order
+would have been about twice too large. Using the reading within the cycle at the first step line of a
+rise only removes all three cases in a recomputation from the 43 logged lines; that rule is not built.
+
+Limits: six runs, one load shape (a single rise by a factor of 12), one cluster, and a maximum of 16
+subtasks that is close to what the load needs. During the warm-up and the first 24 s of run 4, more than
+two minutes before its rise, files were sent to the driver pod; the run is kept and lies inside the
+range of the other five.
+
+### The same option with one-minute windows (cluster test A, 10 runs, registered on 21 Nov)
+
+400, then 4,800 records/s for 8 minutes, the same four jobs, ten runs on 23 Nov between 13:19 and 16:01
+UTC, all valid and none disturbed. With one-minute windows the rule without the option usually recovers
+from a small first order by itself: the order needs new TaskManagers and the next evaluation raises it
+to 16 before the job has restarted. That happened in 9 of 10 runs; in one run (first evaluation 6 s after
+the rise) the step from 2 to 4 was carried out and the job reached 16 only after 150 s.
+
+| 10 runs | shipped band | shipped band, option | band at target | band at target, option |
+|---|---|---|---|---|
+| first order for Aggregate | 4 to 10 | 16 | 4 to 10 | 16 |
+| seconds until 10 subtasks run, mean | 77 | 47 | 77 | 45 |
+| seconds over the limit, mean (monitoring service) | 208 | 136 | 207 | 128 |
+| slots in use, mean | 13.08 | 13.47 | 13.08 | 13.48 |
+
+With the option minus without: -72.1 s [-116.7, -27.5] and -79.6 s [-123.2, -36.0], lower in 10 of 10
+pairs each, for 0.39 slots. In the run with the carried-out small step: -241 and -239 s. Predictions A1,
+A2 and A5 held. A3 and A4 held in part: they named the pairs in which the job without the option first
+ordered fewer than 8, four pairs, and asked for 60 s sooner and 100 s less there; that held in the two
+pairs of the run above and not in two pairs of another run, where the small order was replaced before
+it was carried out (20 and 30 s sooner, 56 and 82 s less). No against-clause is met.
+
+The weakness of section 16 shows here at the first step line: the reading within the cycle was 1.4 to
+2.6 times the load at 5 of 20 first lines. Aggregate was ordered to its maximum of 16 in every job-run,
+so nothing followed for it; the operator behind it was ordered to 5 to 7 subtasks in four job-runs and
+the next evaluation corrected that to 4 before the job restarted. On a job below its maximum the first
+order would have been too large by that factor (`ISSUES.md` #141).
+
+Reproduce: `python3 cluster/bench/stepscore.py results-cluster/stepfix surge_long`,
+`python3 cluster/bench/scalesteps.py results-cluster/stepfix/surge_long/rep*`,
+`python3 cluster/bench/stepnow.py results-cluster/stepfix/surge_long/rep*` (the step lines against the load),
+the same three with `surge` for test A, monitoring extracts in `results-cluster/stepfix/datadog.json`.
+
+### Where the wrong half-second readings come from (a probe on 23 Nov, after the end of the paper's data collection)
+
+`cluster/bench/offprobe.py` creates one topic, sends to it at a known rate with the harness's producer
+settings, and reads the end offsets at about 0, 0.45, 1 and 2 s, without Flink and without the operator.
+It stamps the readings in three ways: when the answer is in (the plugin in Tests C and A), at the middle
+between request and answer (the plugin since 23 Nov), and per partition leader. On the cluster it ran
+for four minutes right after the last run of the default-window campaign (16 partitions, three
+replicas, three jumps from 400 to 4,800 records/s; `results-cluster/offprobe/cluster-2026-11-23.csv`).
+
+| Load 4,800 records/s, steady (36 readings) | lowest | highest | within 20% of the load |
+|---|---|---|---|
+| rate over 0.45 s | 0.26 to 0.30 | 1.88 to 2.03 | 83 to 86% |
+| rate over 1 s | 0.53 to 0.54 | 1.43 to 1.46 | 81 to 86% |
+| rate over 2 s | 0.79 to 0.84 | 1.22 to 1.23 | 94 to 97% |
+
+The ranges are over the three ways of stamping, which differ little; a listing took 30 ms (median) and
+157 ms at most. At 400 records/s the half-second rate ranged from 0.4 to 3.2 times the load and the
+two-second rate from 0.95 to 1.29. On the laptop (one broker, no replication, the same script) every
+half-second reading was 0.93 to 1.12 of the load and every two-second reading 0.97 to 1.03.
+
+Reading. The error is in what the brokers return, not in the operator's timing and not in the load
+generator: a listing of the latest offsets returns the high watermark, which on a replicated topic
+waits for the followers and so advances unevenly at the scale of half a second. That matches what Tests
+C and A showed (most readings right, some far off, two jobs off in the same cycle). A span of two
+seconds, which the changed plugin uses at the first step, brings the reading within about 20% of the
+load. It does not make it exact, and the remedy is still not run in closed loop (Test E).
+
+## 17. The last laptop night: the main campaign with its replacement run, identical jobs in three more scenarios, held-out workloads, slower restarts, failing model calls, single jobs (23 Nov)
+
+All of it was read after the checks entry of 23 Nov 07:11 PST (`paper/outline.md`): 38 runs, none disturbed
+by another container, no testbed event. The four repeats of E8 and the further held-out arms were not
+made. One run that started three minutes after the end of data collection is set aside and not read
+(`ISSUES.md` #142).
+
+### Main campaign with the replacement run (section 14 with one run exchanged)
+
+The ramp with the 4 KiB fetch, repetition 4, had two task failures inside its ramp and was made again
+on the evening of 22 Nov. The arm with the default fetch is unchanged. 4 KiB fetch, 40 runs:
+
+| contrast | time over the limit | with the original run | slots |
+|---|---|---|---|
+| PaC - Builtin | -6.8% [-22.7, +9.0] | -4.8% [-19.9, +10.4] | -2.9% [-9.3, +3.6] |
+| DM - PaC | -2.2% [-10.1, +5.7] | -6.4% [-16.6, +3.9] | +1.1% [-2.2, +4.5] |
+| LLM - PaC | +1.2% [-8.4, +10.7] | -0.5% [-9.7, +8.6] | +3.4% [+0.5, +6.2] |
+
+No test is significant after Holm in either arm, as before, and the wording stays "no detectable
+difference"; the intervals now allow up to 34% less or 11% more. One margin check changes: the LLM's
+time with the 4 KiB fetch is no longer inside 10%. On the ramp with the 4 KiB fetch the policy is now
+21.2 s [41.9, 0.6] ahead of the built-in rule, in 7 of 8 runs. Decisions of the measured phases: decision
+model 1,946 of 1,963, LLM 1,763 of 1,767. The replacement run ended while the host's load rose (38, 34
+and 25 in its last two and a half minutes), so it stays in the list of marked runs, and the figures
+without marked runs are those of section 14.
+
+### Identical jobs in the skew, the ramp and the drop (E2c, 24 runs, four predictions, all met)
+
+Four jobs with the policy in code and identical settings, the same eight draws as the main campaign.
+The statistic of the main campaign's contrasts applied to two identical jobs:
+
+| | pooled difference | spread per pair | skew | ramp | drop |
+|---|---|---|---|---|---|
+| job b minus job a | +4.6% [-27.3, +36.6] | 76% | 132% | 35% | 5% |
+| job d minus job c | -4.3% [-16.5, +8.0] | 29% | 46% | 19% | 10% |
+| DM minus PaC, main campaign, same scenarios | -19.1% [-44.9, +6.7] | 61% | | | |
+| LLM minus PaC, main campaign, same scenarios | -21.9% [-50.0, +6.1] | 66% | | | |
+
+In the skew two identical jobs differed by up to 90 s in one run. Over all six pairs of a run the mean
+absolute relative difference is 26.5% [9.5, 43.6] (skew 52%, ramp 22%, drop 6%), against 10% in the
+spike and the slow-down (section 4). So identical jobs in these scenarios differ as much as the models
+differed from the policy, which is what the paper's reading of the models' lead as noise needed. The
+models' pooled means (-19% and -22%) lie inside the interval of one identical pair and below that of the
+other; this is a comparison of spreads, not a test.
+
+### Ten held-out workloads (E5, one run each, two predictions, both met)
+
+Workloads drawn at random after the plugin, the prompts and the thresholds were frozen (seeds 101 to
+110). The decision model's most likely option was the policy's in 1,004 of 1,024 decisions of the
+measured phases (98.0%; 20 below, 2 applied) and the LLM's in 869 of 871 (99.8%; 2 above, both applied).
+Pooled over the workloads: DM - PaC +7% [-8, +21] of a workload's mean time over the limit and +1%
+[-2, +4] of the slots; LLM - PaC +3% [-14, +19] and +1% [-1, +4]; PaC - Builtin -17% [-49, +15] and +1%
+[-3, +5]. Ten pairs cannot put an interval inside 10%. No fallback in 1,312 model calls.
+
+### Restarts that take a minute longer (E4, 10 runs, no prediction): the policy was over the limit for longer, mostly because the built-in rule kept the size it had reached in the warm-up
+
+Every restart waits 60 s longer when the job restores, and the controllers are told a restart time of
+70 s. A longer spike and a longer ramp, five runs each.
+
+| | Builtin | PaC | DM | LLM |
+|---|---|---|---|---|
+| spike: seconds over the limit / rescalings | 175 / 2.0 | 306 / 3.4 | 263 / 2.8 | 292 / 3.0 |
+| ramp: seconds over the limit / rescalings | 244 / 1.6 | 350 / 2.8 | 357 / 2.8 | 369 / 2.8 |
+
+PaC - Builtin: +44.9% [+20.9, +69.0] of a scenario's mean time over the limit, higher in 9 of 10 runs
+(+131 s in the spike, +105 s on the ramp), slots -1.7% [-13.4, +10.1]. In the six runs made after the
+other project's workload had left the laptop: +64.2% [+31.6, +96.7]. DM - PaC -6.6% [-16.6, +3.4], LLM -
+PaC +0.2% [-7.8, +8.3]. With ordinary restarts the policy was 27 and 28 s ahead of the built-in rule in
+the short spike and ramp (section 14).
+
+Correction of 23 Nov 11:04 PST (review round 4, methodology review, W1; checked with
+`python3 bench/e4_start.py`). The first reading of these runs was "the policy takes more steps and pays
+for each restart". The runs do not isolate that. With every restart 60 s longer the first start of a job
+is slow as well, a backlog builds in the warm-up, and 28 of the 40 job-runs scaled Aggregate up before
+the measured phase began; in none of the ten runs were all four jobs at the scenario's size at its
+start. The built-in rule kept that size, with its scale-down delay, and met the load change above the
+scenario's size in 6 of the 10 runs. The policy gave the capacity back before the load changed in 7 of
+the 10, which cost it a restart: it was over the limit for 32.3 s per run before the load changed (the
+built-in rule: 0.6 s). Split by the built-in rule's size just before the load change, a state that uses
+no outcome:
+
+| Runs | PaC - Builtin, share of a scenario's mean time over the limit | PaC longer in |
+|---|---|---|
+| all ten | +44.9% [+20.9, +69.0] | 9 of 10 |
+| Builtin at the scenario's size at the load change (4) | +15.0% [-10.9, +40.9] | 3 of 4 |
+| Builtin above it (6) | +64.9% [+37.6, +92.2] | 6 of 6 |
+| all ten, from the load change on | +32.0% [+8.7, +55.2] | 7 of 10 |
+
+So where both jobs met the load change at the same size, the runs show no detectable difference, and
+four runs are too few to say there is none. What the campaign does show: with slow restarts a job that
+gives capacity back pays a restart for it and is small when the load comes, and a job that holds its
+size is ready. That is the scale-down delay again (section 10), not a measurement of what extra steps
+cost. The harness's warm-up check waits for the backlog to drain and does not look at the size; by the
+main campaign's rule for a disturbed start (jobs at unequal sizes) eight of the ten runs would be marked
+(`ISSUES.md` #146). The paper no longer carries this result in its abstract.
+
+### Model calls that fail or hang during the spike (E9, three runs each)
+
+In 47 of the 48 cycles that fell into the fault the plugin fell back to the built-in rule (decision
+model 17 of 17 and 11 of 11, LLM 13 of 14 and 6 of 6). The first scale-up came 52 and 50 s after the
+spike began with failing calls and 74 and 87 s with hanging calls (policy 12 and 14 s, built-in rule 25
+and 29 s); a hanging call stretched a cycle from 15 s to 27 and 31 s. Seconds over the limit: 154 and
+173 (failing), 173 and 160 (hanging), where the same controllers take 145 and 147 s without a fault and
+the built-in rule took 175 and 168 s in the same runs. During the last two and a half minutes of one
+hanging run the host's load was 33 to 70; without that run the figures are 172 and 155 s. Six runs, no
+test.
+
+### One job alone (E2, spike, three runs each)
+
+Built-in rule alone 172.7 s over the limit, among four 168.8 s (five runs): +3.9 s [-15.6, +23.3]. Policy
+alone 149.3 s, among four 136.5 s (three runs): +12.8 s [-5.6, +31.3]. Both together +8.4 s [+0.4,
++16.3], six runs against eight that were made five days earlier. Running four jobs side by side did not
+lengthen a job's time over the limit; six runs cannot show an interference below about 10 s.
+
+Reproduce: `python3 bench/paper.py main` (and `e2c`, `e5`, `e4`, `e9`, `e2`), `python3 bench/main_marked.py`,
+`python3 bench/e2c_pairs.py`, `python3 bench/e4_blocks.py`, `python3 cluster/bench/decount.py <run dirs>`.

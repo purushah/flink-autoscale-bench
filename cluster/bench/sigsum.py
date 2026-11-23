@@ -1,10 +1,13 @@
 """The backlog signal in closed loop on the cluster (plan entry of 2026-11-21 13:10 PST): broker-side signal
 against default signal within each band, paired within runs.
-   python3 sigsum.py <campaign dir, e.g. results-cluster/signal> [scenario] [--one-test] [--tex <file> <macro prefix>]
+   python3 sigsum.py <campaign dir, e.g. results-cluster/signal> [scenario] [--one-test] [--no-test] [--without N[,N]] [--tex <file> <macro prefix>]
 With --tex it also writes the numbers as LaTeX macros (monitoring service for seconds and slots, harness
 files for the counts). With --one-test the plan names one primary test, the shipped band, without a
 correction (the long-window campaign, entry of 2026-11-21 14:06 PST): the macro for its p-value is the
-exact one and the band at the target gets none.
+exact one and the band at the target gets none. With --no-test no p-value is computed or written (the
+plan's rule for a campaign that ends with fewer runs than planned: pairs, t interval and signs). With
+--without the runs with these numbers are left out (runs that the cluster disturbed, marked by
+disturbed_cluster.py before any outcome was read).
 Primary numbers are those of the monitoring service (<campaign dir>/datadog.json: per run and job
 [seconds over the limit, seconds measured, slots registered, slots free]). The harness files give the
 same quantities, the scale-ups of Aggregate, the restarts and the time until Aggregate runs with enough
@@ -116,7 +119,13 @@ def formula_sizes(runs, cap=16):
 def main():
     argv = sys.argv[1:]
     one_test = "--one-test" in argv
-    argv = [x for x in argv if x != "--one-test"]
+    no_test = "--no-test" in argv
+    argv = [x for x in argv if x not in ("--one-test", "--no-test")]
+    without = set()
+    if "--without" in argv:
+        i = argv.index("--without")
+        without = {int(x) for x in argv[i + 1].split(",")}
+        argv = argv[:i] + argv[i + 2:]
     tex = None
     if "--tex" in argv:
         i = argv.index("--tex")
@@ -124,7 +133,9 @@ def main():
         argv = argv[:i] + argv[i + 3:]
     camp = argv[0]
     scenario = argv[1] if len(argv) > 1 else "surge"
-    runs = sorted(glob.glob(os.path.join(camp, scenario, "rep*")), key=lambda d: int(d.rsplit("rep", 1)[1]))
+    runs = sorted((d for d in glob.glob(os.path.join(camp, scenario, "rep*")) if d.rsplit("rep", 1)[1].isdigit()),
+                  key=lambda d: int(d.rsplit("rep", 1)[1]))
+    runs = [d for d in runs if int(d.rsplit("rep", 1)[1]) not in without]
     dd = {}
     if os.path.exists(os.path.join(camp, "datadog.json")):
         dd = json.load(open(os.path.join(camp, "datadog.json"))).get("runs", {})
@@ -140,7 +151,8 @@ def main():
                      dd_slots=(x[2] - x[3]) if x else float("nan"))
             rows.append(v)
     reps = sorted({r["rep"] for r in rows})
-    print(f"{camp}, {scenario}: {len(reps)} runs; Aggregate covers the peak load at {need} subtasks")
+    print(f"{camp}, {scenario}: {len(reps)} runs{' (left out: ' + ', '.join(map(str, sorted(without))) + ')' if without else ''}; "
+          f"Aggregate covers the peak load at {need} subtasks")
     print("per run: seconds over the limit (monitoring service / harness), slots held (service) and in use (harness), scale-ups of Aggregate, restarts, seconds until the load is covered, sizes of Aggregate")
     for r in rows:
         print(f"   rep {r['rep']}  {r['job']:<22} over {r['dd_over']:>5.0f} / {r['over']:>4}   slots {r['dd_slots']:>5.2f} / {r['slots']:>5.2f}   "
@@ -161,8 +173,9 @@ def main():
                 continue
             mean, lo, hi = interval(diff)
             base = np.mean([by[(k, a)][key] for k in reps if (k, a) in by])
-            p = sign_flip_p(diff)
-            ps[(source, band)] = p
+            p = float("nan") if no_test else sign_flip_p(diff)
+            if not no_test:
+                ps[(source, band)] = p
             if source == "monitoring service":
                 B = "Stock" if band == "shipped band" else "Target"
                 bro = np.mean([by[(k, b)][key] for k in reps if (k, b) in by])
@@ -173,7 +186,8 @@ def main():
                             B + "DefaultMin": f"{min(by[(k, a)][key] for k in reps if (k, a) in by):.0f}",
                             B + "DefaultMax": f"{max(by[(k, a)][key] for k in reps if (k, a) in by):.0f}"})
             print(f"   seconds over the limit, {source:<18} {band:<18} {mean:+7.1f} [{lo:+7.1f}, {hi:+7.1f}]  {100 * mean / base:+5.0f}% of the default's {base:.0f} s  "
-                  f"lower in {sum(x < 0 for x in diff)} of {len(diff)}  exact p {p:.4f}")
+                  f"lower in {sum(x < 0 for x in diff)} of {len(diff)}  " + ("no test" if no_test else f"exact p {p:.4f}")
+                  + "  by run " + ", ".join(f"{x:+.0f}" for x in diff))
     for source in ("monitoring service", "harness"):
         p = [ps[(source, band)] for band, _, _ in PAIRS if (source, band) in ps]
         if len(p) == 2:
@@ -250,7 +264,7 @@ def main():
             f.write(f"% written by cluster/bench/sigsum.py from {camp}, scenario {scenario}\n")
             for k in sorted(mac):
                 value = str(mac[k])
-                if value.isdigit() and len(value) > 3:  # 1661 -> 1{,}661, as the text writes thousands
+                if value.lstrip("-").isdigit() and len(value.lstrip("-")) > 3:  # 1661 -> 1{,}661, as the text writes thousands
                     value = f"{int(value):,}".replace(",", "{,}")
                 f.write(f"\\newcommand{{\\{tex[1]}{k}}}{{{value}}}\n")
         print(f"wrote {len(mac)} macros to {tex[0]}")

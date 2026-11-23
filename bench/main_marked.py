@@ -6,8 +6,9 @@
 
 For both arms, the three planned contrasts (PaC - Builtin, DM - PaC, LLM - PaC) on the two primary
 metrics (seconds over the limit, slots):
- - with all runs, and without the marked runs (plan entry of 2026-11-22 01:16 PST: the seven runs with
-   a job exception and the run in which a TaskManager was lost);
+ - with all runs, and without the marked runs (plan entries of 2026-11-22 01:16 PST and 2026-11-23 07:11
+   PST: six runs with a job exception, the run in which a TaskManager was lost, and the replacement of
+   accurate/ramp/rep4, which ended under a high host load);
  - for the runs made by day and by night (amendment of 2026-11-21 13:27 PST; a check, not planned);
  - next to each pooled figure the number of pairs whose divisor is the floor;
  - the verdict against the margins of practical relevance (10% of the seconds, 4% of the slots);
@@ -35,7 +36,7 @@ MARKED = {
     ("default", "spike", 2): "job exception 128 s after the load change",
     ("accurate", "ramp", 3): "job exception 247 s after the load change",
     ("accurate", "skew", 3): "job exception 159 s after the load change; not settled at the start",
-    ("accurate", "ramp", 4): "job exception 42 s after the load change",
+    ("accurate", "ramp", 4): "replacement run of 22 Nov (the first had task failures inside the load change); host load 25 to 38 in its last 150 s",
     ("accurate", "spike", 3): "a TaskManager of the LLM job lost 72 s after the load change",
 }
 MARGIN = {"slo_violation_s": 0.10, "slots_mean": 0.04}

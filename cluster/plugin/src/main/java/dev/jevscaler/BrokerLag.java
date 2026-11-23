@@ -80,6 +80,13 @@ final class BrokerLag {
 
     private BrokerLag() {}
 
+    /** A further reading of the end offsets some seconds after the first one of a cycle. */
+    @FunctionalInterface
+    interface Confirm {
+        /** The arrival rate over that span and the span in seconds, or null when the reading failed. */
+        double[] read();
+    }
+
     static Map<ScalingMetric, EvaluatedScalingMetric> overrides(
             JobState job,
             ScalingMetricsEvaluatorPlugin.Context<?> ctx,
@@ -90,7 +97,8 @@ final class BrokerLag {
             String auth,
             Instant now,
             boolean stepAware,
-            double stepMargin) {
+            double stepMargin,
+            double stepConfirmSeconds) {
         try {
             if (bootstrapServers == null || bootstrapServers.isBlank() || ctx.getJobID() == null) {
                 return Map.of();
@@ -111,13 +119,15 @@ final class BrokerLag {
                 try {
                     var first = new HashMap<TopicPartition, OffsetSpec>();
                     known.forEach(tp -> first.put(tp, OffsetSpec.latest()));
+                    long sent = System.nanoTime();
                     var answer =
                             admin(bootstrapServers, auth).listOffsets(first).all().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
                     var offsets = new HashMap<TopicPartition, Long>();
                     for (var e : answer.entrySet()) {
                         offsets.put(e.getKey(), e.getValue().offset());
                     }
-                    earlyNanos = System.nanoTime();
+                    // The broker read the offsets between the request and the answer: take the middle.
+                    earlyNanos = (sent + System.nanoTime()) / 2;
                     early = offsets;
                 } catch (Exception e) {
                     // The second reading is an extra: without it the newest interval's rate is used.
@@ -131,9 +141,10 @@ final class BrokerLag {
             }
             var request = new HashMap<TopicPartition, OffsetSpec>();
             positions.keySet().forEach(tp -> request.put(tp, OffsetSpec.latest()));
+            long endsSent = System.nanoTime();
             var ends =
                     admin(bootstrapServers, auth).listOffsets(request).all().get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
-            double seconds = (System.nanoTime() - earlyNanos) / 1e9;
+            double seconds = ((endsSent + System.nanoTime()) / 2 - earlyNanos) / 1e9;
             if (stepAware) {
                 PARTITIONS.put(job, Set.copyOf(positions.keySet()));
             }
@@ -156,7 +167,37 @@ final class BrokerLag {
                 lag += Math.max(0, end - position);
                 endSum += end;
             }
-            return overrides(job, evaluated, conf, lag, endSum, now, stepAware, stepMargin, instantRate);
+            Confirm confirm = null;
+            if (!Double.isNaN(instantRate) && stepConfirmSeconds > 0) {
+                final Map<TopicPartition, Long> firstReading = early;
+                final long firstNanos = earlyNanos;
+                confirm = () -> {
+                    try {
+                        long waitMs = Math.round(stepConfirmSeconds * 1000 - (System.nanoTime() - firstNanos) / 1e6);
+                        if (waitMs > 0) {
+                            Thread.sleep(waitMs);
+                        }
+                        long sent = System.nanoTime();
+                        var third = admin(bootstrapServers, auth)
+                                .listOffsets(request)
+                                .all()
+                                .get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+                        double span = ((sent + System.nanoTime()) / 2 - firstNanos) / 1e9;
+                        double arrived = 0;
+                        for (var tp : positions.keySet()) {
+                            arrived += Math.max(0, third.get(tp).offset() - firstReading.get(tp));
+                        }
+                        return new double[] {arrived / span, span};
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return null;
+                    } catch (Exception e) {
+                        LOG.debug("No third reading of the end offsets in this cycle. {}", e.toString());
+                        return null;
+                    }
+                };
+            }
+            return overrides(job, evaluated, conf, lag, endSum, now, stepAware, stepMargin, instantRate, seconds, confirm);
         } catch (Exception e) {
             LOG.warn("Could not read the backlog from the broker; keeping the built-in metrics. {}", e.toString());
             return Map.of();
@@ -179,10 +220,12 @@ final class BrokerLag {
      * records of the newest interval arrived faster than the window's average by more than {@code
      * stepMargin} and the backlog grew by more than that share of the average in the same
      * interval, the job is not keeping up with a load that has risen. The demand is then the rate
-     * of the newest interval, or {@code instantRate}, the rate between two readings within this
-     * cycle, when that is higher: a jump that happened a few seconds ago fills only a part of the
-     * newest interval. The window's average is the demand in every other case, so the demand is
-     * never lowered by this.
+     * of the newest interval. At the first such evaluation of a rise it is {@code instantRate}, the
+     * rate between two readings within this cycle, when that is higher: a jump that happened a few
+     * seconds ago fills only a part of the newest interval. At later ones the newest interval lies
+     * after the jump and decides alone, because a rate over half a second can be off by a factor of
+     * two (ISSUES.md #141). The window's average is the demand in every other case, so the demand
+     * is never lowered by this.
      */
     static Map<ScalingMetric, EvaluatedScalingMetric> overrides(
             JobState job,
@@ -194,6 +237,41 @@ final class BrokerLag {
             boolean stepAware,
             double stepMargin,
             double instantRate) {
+        return overrides(job, evaluated, conf, lag, endSum, now, stepAware, stepMargin, instantRate, Double.NaN);
+    }
+
+    /** The same; {@code instantSeconds} is the time between the two readings, for the log. */
+    static Map<ScalingMetric, EvaluatedScalingMetric> overrides(
+            JobState job,
+            Map<ScalingMetric, EvaluatedScalingMetric> evaluated,
+            Configuration conf,
+            double lag,
+            double endSum,
+            Instant now,
+            boolean stepAware,
+            double stepMargin,
+            double instantRate,
+            double instantSeconds) {
+        return overrides(job, evaluated, conf, lag, endSum, now, stepAware, stepMargin, instantRate, instantSeconds, null);
+    }
+
+    /**
+     * The same. When the first step of a rise would take {@code instantRate}, {@code confirm} is asked
+     * for the rate over a longer span, which is then the demand if it is above the newest interval's
+     * rate; without such a reading the short one is taken (ISSUES.md #141).
+     */
+    static Map<ScalingMetric, EvaluatedScalingMetric> overrides(
+            JobState job,
+            Map<ScalingMetric, EvaluatedScalingMetric> evaluated,
+            Configuration conf,
+            double lag,
+            double endSum,
+            Instant now,
+            boolean stepAware,
+            double stepMargin,
+            double instantRate,
+            double instantSeconds,
+            Confirm confirm) {
         double window = conf.get(AutoScalerOptions.METRICS_WINDOW).toMillis() / 1000.0;
         double rate = Double.NaN;
         synchronized (job.endOffsets) {
@@ -206,7 +284,9 @@ final class BrokerLag {
                     break;
                 }
             }
-            job.endOffsets.addLast(new double[] {now.toEpochMilli() / 1000.0, endSum, lag});
+            // The fourth entry is 1 when this evaluation reports a step in the arrival rate.
+            double[] sample = {now.toEpochMilli() / 1000.0, endSum, lag, 0};
+            job.endOffsets.addLast(sample);
             double t = now.toEpochMilli() / 1000.0;
             // Keep one sample older than the window, so that the rate always spans a full window.
             while (job.endOffsets.size() > 2 && t - job.endOffsets.get(1)[0] >= window) {
@@ -223,12 +303,31 @@ final class BrokerLag {
                 double recent = (endSum - previous[1]) / span;
                 double backlogGrowth = (lag - previous[2]) / span;
                 if (recent > rate * (1 + stepMargin) && backlogGrowth > rate * stepMargin) {
-                    double demand = !Double.isNaN(instantRate) && instantRate > recent ? instantRate : recent;
+                    // The evaluation that starts the newest interval saw the step already: the
+                    // interval lies after the jump, and the reading within this cycle is not needed.
+                    boolean first = previous.length < 4 || previous[3] == 0;
+                    sample[3] = 1;
+                    double demand = recent;
+                    String third = "";
+                    if (first && !Double.isNaN(instantRate) && instantRate > recent) {
+                        double[] longer = confirm == null ? null : confirm.read();
+                        if (longer != null && longer.length > 1 && !Double.isNaN(longer[0])) {
+                            demand = Math.max(recent, longer[0]);
+                            third = String.format(
+                                    java.util.Locale.ROOT, ", %d records/s over %.2f s in a third reading", Math.round(longer[0]), longer[1]);
+                        } else {
+                            demand = instantRate;
+                        }
+                    }
                     LOG.info(
                             "Step in the arrival rate: {} records/s over the last {} s against {} over the window, backlog"
-                                    + " growing by {} records/s, {} records/s now; the demand is {}.",
+                                    + " growing by {} records/s, {} records/s now; the demand is {} ({} step line of"
+                                    + " this rise, {} s between the two readings{}).",
                             Math.round(recent), Math.round(span), Math.round(rate), Math.round(backlogGrowth),
-                            Double.isNaN(instantRate) ? "unknown" : String.valueOf(Math.round(instantRate)), Math.round(demand));
+                            Double.isNaN(instantRate) ? "unknown" : String.valueOf(Math.round(instantRate)), Math.round(demand),
+                            first ? "first" : "later",
+                            Double.isNaN(instantSeconds) ? "unknown" : String.format(java.util.Locale.ROOT, "%.2f", instantSeconds),
+                            third);
                     rate = demand;
                 }
             }

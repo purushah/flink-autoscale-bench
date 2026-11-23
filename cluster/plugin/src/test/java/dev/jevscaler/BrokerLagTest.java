@@ -123,6 +123,89 @@ class BrokerLagTest {
     }
 
     @Test
+    void afterTheFirstStepOfARiseTheNewestIntervalDecides() {
+        var job = new JevRuntime.JobState();
+        for (int i = 0; i <= 4; i++) {
+            BrokerLag.overrides(job, believed(), conf(), 200, 1_000_000 + i * 6000, NOW.plusSeconds(i * 15), true, 0.2, 400);
+        }
+        // The jump is 2 s old: the reading within the cycle sizes the first step (ISSUES.md #123).
+        var first = BrokerLag.overrides(job, believed(), conf(), 9000, 1_024_000 + 14_800, NOW.plusSeconds(75), true, 0.2, 4800);
+        assertEquals(4800, first.get(ScalingMetric.TARGET_DATA_RATE).getAverage(), 1e-6);
+        // One cycle later the newest interval lies after the jump: 72,000 records in 15 s. A reading
+        // within the cycle of 2.25 times the load is not used, and a low one changes nothing (ISSUES.md #141).
+        var later = BrokerLag.overrides(job, believed(), conf(), 70_000, 1_038_800 + 72_000, NOW.plusSeconds(90), true, 0.2, 10_800, 0.45);
+        assertEquals(4800, later.get(ScalingMetric.TARGET_DATA_RATE).getAverage(), 1e-6);
+        var again = BrokerLag.overrides(job, believed(), conf(), 131_000, 1_110_800 + 72_000, NOW.plusSeconds(105), true, 0.2, 1900, 0.45);
+        assertEquals(4800, again.get(ScalingMetric.TARGET_DATA_RATE).getAverage(), 1e-6);
+    }
+
+    @Test
+    void theFirstStepOfARiseIsConfirmedOverALongerSpan() {
+        // 13 s at 400 rec/s and 2 s at 4800 rec/s; the reading over half a second says 10,800 rec/s (ISSUES.md #141).
+        double[][] third = {{4790, 2.0}, {500, 2.0}, null, {Double.NaN, 2.0}};
+        double[] expected = {4790, 14_800 / 15.0, 10_800, 10_800};
+        for (int k = 0; k < third.length; k++) {
+            var job = new JevRuntime.JobState();
+            for (int i = 0; i <= 4; i++) {
+                BrokerLag.overrides(job, believed(), conf(), 200, 1_000_000 + i * 6000, NOW.plusSeconds(i * 15), true, 0.2, 400);
+            }
+            double[] answer = third[k];
+            int[] asked = {0};
+            BrokerLag.Confirm confirm = () -> {
+                asked[0]++;
+                return answer;
+            };
+            var out = BrokerLag.overrides(
+                    job, believed(), conf(), 9000, 1_024_000 + 14_800, NOW.plusSeconds(75), true, 0.2, 10_800, 0.45, confirm);
+            // The longer reading is the demand when it is above the newest interval's rate; without one the short reading stays.
+            assertEquals(expected[k], out.get(ScalingMetric.TARGET_DATA_RATE).getAverage(), 1e-3);
+            assertEquals(1, asked[0]);
+            // One cycle later the newest interval decides and no third reading is taken.
+            out = BrokerLag.overrides(
+                    job, believed(), conf(), 70_000, 1_038_800 + 72_000, NOW.plusSeconds(90), true, 0.2, 10_800, 0.45, confirm);
+            assertEquals(4800, out.get(ScalingMetric.TARGET_DATA_RATE).getAverage(), 1e-6);
+            assertEquals(1, asked[0]);
+        }
+    }
+
+    @Test
+    void noThirdReadingWhenTheShortOneIsNotAboveTheNewestInterval() {
+        var job = new JevRuntime.JobState();
+        for (int i = 0; i <= 4; i++) {
+            BrokerLag.overrides(job, believed(), conf(), 200, 1_000_000 + i * 6000, NOW.plusSeconds(i * 15), true, 0.2, 400);
+        }
+        int[] asked = {0};
+        BrokerLag.Confirm confirm = () -> {
+            asked[0]++;
+            return new double[] {9999, 2.0};
+        };
+        // 9 s at 400 rec/s and 6 s at 4800 rec/s: the newest interval says 2160 rec/s, the short reading 1900.
+        var out = BrokerLag.overrides(
+                job, believed(), conf(), 26_600, 1_024_000 + 32_400, NOW.plusSeconds(75), true, 0.2, 1900, 0.45, confirm);
+        assertEquals(2160, out.get(ScalingMetric.TARGET_DATA_RATE).getAverage(), 1e-6);
+        assertEquals(0, asked[0]);
+    }
+
+    @Test
+    void aNewRiseAfterAQuietEvaluationUsesTheReadingWithinTheCycleAgain() {
+        var job = new JevRuntime.JobState();
+        for (int i = 0; i <= 4; i++) {
+            BrokerLag.overrides(job, believed(), conf(), 200, 1_000_000 + i * 6000, NOW.plusSeconds(i * 15), true, 0.2, 400);
+        }
+        // A first rise, seen 2 s after it happened.
+        BrokerLag.overrides(job, believed(), conf(), 9000, 1_024_000 + 14_800, NOW.plusSeconds(75), true, 0.2, 4800);
+        // The job keeps up for five minutes at 4800 rec/s: no growing backlog, no step reported.
+        long end = 1_038_800;
+        for (int i = 1; i <= 20; i++) {
+            end += 72_000;
+            BrokerLag.overrides(job, believed(), conf(), 9000, end, NOW.plusSeconds(75 + i * 15), true, 0.2, 4800);
+        }
+        // A second rise, to 14,400 rec/s, 4 s before this evaluation: 11 s at 4800 and 4 s at 14,400.
+        var out = BrokerLag.overrides(job, believed(), conf(), 47_400, end + 110_400, NOW.plusSeconds(75 + 21 * 15), true, 0.2, 14_400, 0.5);
+        assertEquals(14_400, out.get(ScalingMetric.TARGET_DATA_RATE).getAverage(), 1e-6);
+    }
+
+    @Test
     void theStepAwareDemandIsNeverBelowTheWindowsAverage() {
         var job = new JevRuntime.JobState();
         // 4800 rec/s for a minute, then the load falls to 400 rec/s while a backlog is still there.

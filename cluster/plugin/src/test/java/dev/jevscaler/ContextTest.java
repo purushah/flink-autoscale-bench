@@ -91,6 +91,44 @@ class ContextTest {
     }
 
     @Test
+    void aScaleDownKeepsWhatTheLevelPlusItsMarginNeeds() {
+        var cfg = JevConfig.defaults(); // 70% target, a scale-down has to save two subtasks
+        cfg.maxParallelism = 16;
+        cfg.scaleDownWindowSeconds = 600;
+        cfg.windowCapsTrend = true;
+
+        // A recorded evaluation (on-off run of the cluster, low phase): 12 subtasks, one reading of
+        // 461 rec/s per subtask, demand 797, the window's highest demand 3216. 3216/0.7/461 = 9.97:
+        // 10 subtasks just fit, and the job scaled down. In the next high phase the reading was 443,
+        // the level needed 10.4, and the job scaled up again (ISSUES.md #119, second cause).
+        var low = vertex("agg", "operator", 12, 461, 797);
+        low.peakRate = 3216;
+        low.priorPeakRate = 3216;
+        assertEquals(10, ruleTarget(cfg, NOW, low));
+
+        // Kept for the level plus the margin: 3216 * 1.1 / 0.7 / 461 = 10.97 needs 11, one subtask
+        // fewer than 12, and that does not pay for a restart.
+        cfg.windowKeepsMargin = true;
+        var held = vertex("agg", "operator", 12, 461, 797);
+        held.peakRate = 3216;
+        held.priorPeakRate = 3216;
+        assertEquals(12, ruleTarget(cfg, NOW, held));
+
+        // From 16 subtasks the same level still allows a scale-down, to 11.
+        var first = vertex("agg", "operator", 16, 461, 797);
+        first.peakRate = 3216;
+        first.priorPeakRate = 3216;
+        assertEquals(11, ruleTarget(cfg, NOW, first));
+
+        // Without a window nothing is kept and the option changes nothing: 797 rec/s is sized at
+        // (797/0.7 + 797 * 30/60) / 461 -> 4, and 12 is scaled down by at most half.
+        var none = JevConfig.defaults();
+        none.maxParallelism = 16;
+        none.windowKeepsMargin = true;
+        assertEquals(6, ruleTarget(none, NOW, vertex("agg", "operator", 12, 461, 797)));
+    }
+
+    @Test
     void theWindowCapsTheTrendProjectionAtTheHighestDemandItHasSeen() {
         var cfg = JevConfig.defaults(); // 70% target, 30 s restart, 60 s catch-up, 2 minute horizon
         cfg.maxParallelism = 32;
@@ -315,12 +353,14 @@ class ContextTest {
                         JevConfig.PREFIX + "scale-down.window-seconds", "600",
                         JevConfig.PREFIX + "scale-down.window-caps-trend", "true",
                         JevConfig.PREFIX + "scale-down.window-cap-margin", "0.05",
+                        JevConfig.PREFIX + "scale-down.window-keeps-margin", "true",
                         JevConfig.PREFIX + "lag.step-aware", "true",
                         JevConfig.PREFIX + "lag.step-margin", "0.3",
                         JevConfig.PREFIX + "scale-down.min-slots", "2");
         var cfg = JevConfig.from(conf::get);
         assertTrue(cfg.windowCapsTrend);
         assertEquals(0.05, cfg.windowCapMargin);
+        assertTrue(cfg.windowKeepsMargin);
         assertTrue(cfg.lagStepAware);
         assertEquals(0.3, cfg.lagStepMargin);
         assertEquals(2, cfg.scaleDownMinSlots);
@@ -337,6 +377,7 @@ class ContextTest {
         assertEquals(0, none.scaleDownWindowSeconds);
         assertFalse(none.windowCapsTrend);
         assertEquals(0.1, none.windowCapMargin);
+        assertFalse(none.windowKeepsMargin);
         assertFalse(none.lagStepAware);
         assertEquals(0.2, none.lagStepMargin);
         assertEquals(0, none.scaleDownMinSlots);

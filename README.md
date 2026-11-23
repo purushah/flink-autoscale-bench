@@ -16,7 +16,6 @@
 >   the test laptop (`other-container-N`), and the cluster's name (`cluster`, also in file names,
 >   folder names and image tags). Checksums quoted in the text are those of the files before these
 >   replacements.
-> - This first import holds the code and the documents. The raw data follows.
 
 This repository holds a plugin for the autoscaler of Flink Kubernetes Operator 1.16.1, a benchmark,
 and the analysis behind a study of two questions:
@@ -269,10 +268,24 @@ runs: 16 subtasks per vertex). The test is exploratory. Its results are sections
 | `cluster/bench/oplog.py` | The operator's log of a cluster run from both copies the harness keeps (the log fetched at the end, which can start late after a rotation, and the log followed during the run), each line once and in time order; used by `scalesteps.py` and `stepscore.py` (ISSUES.md #126). `python3 cluster/bench/oplog.py <run dir>` prints what each copy covers |
 | `cluster/bench/stepscan.py` | The step-aware demand (ISSUES.md #123), checked for false alarms on recorded signal runs: applies the option's condition at every evaluation of every job with the broker-side signal and counts the steps before the rise, right after it, later in the overload and after the fall: `python3 cluster/bench/stepscan.py results-cluster/signal/surge/rep1 ...` |
 | `cluster/bench/capreplay.py` | The cap on the trend projection (ISSUES.md #119), replayed on recorded on-off runs: for every scale-up the jobs with the look-back ordered from the second high phase on, the policy's threshold as logged, with the cap as first built, and with the cap at the earlier level itself; reads the decision logs only: `python3 cluster/bench/capreplay.py results-cluster/flapping/onoff/rep1 ...` |
+| `cluster/bench/readfail.py` | Check without any outcome: did the plugin fail to read the backlog from the brokers between the two load changes of a cluster run (the operator's line "Could not read the backlog from the broker")? Run from `cluster/bench`: `python3 readfail.py ../../results-cluster/defaultwin/surge_default/rep*` |
+| `cluster/bench/stepnow.py`, `steptex.py` | The step lines of the step-aware demand against the load that was sent (newest interval, the reading within the cycle, the demand; ISSUES.md #141), and the paper's macros for Tests C and A: `python3 cluster/bench/stepnow.py results-cluster/stepfix/surge/rep*`. `queue_stepfix2.sh` is the queue of the check of the remedy (four jobs that all have the option, operator image with the reading over two seconds) |
+| `cluster/bench/offprobe.py` | A probe without Flink and without the operator: one topic, a load of known rate, and the end offsets read over 0.45, 1 and 2 s with three ways of stamping a reading. It shows how far a rate between two readings of the end offsets is from the true rate (ISSUES.md #141; FINDINGS.md section 16). `python3 cluster/bench/offprobe.py out.csv` uses the laptop's broker; with `--conf <cluster settings>` it logs in as the harness does. It creates and deletes a topic of its own and sends its own load: do not run it next to a measured run. Readings: `results-cluster/offprobe/` |
+| `cluster/bench/beliefs.py` | What the rule believed (demand and backlog) at its first evaluation on a full window of overload in the cluster signal campaign, against the truth: `python3 cluster/bench/beliefs.py results-cluster/signal surge 60 125` |
+| `cluster/bench/keepreplay.py`, `queue_keepfix.sh` | The margin on the size a scale-down keeps (`scale-down.window-keeps-margin`, ISSUES.md #119, second cause): a replay on recorded on-off runs and the queue of its test |
+| `bench/e4_start.py`, `bench/e4_blocks.py` | The campaign with every restart 60 s longer: the contrasts by block, and the state of the jobs when the measured phase begins and when the load changes (they had rescaled in the warm-up; ISSUES.md #146): `python3 bench/e4_start.py` |
 | `cluster/plugin/` | The plugin with four more settings (below). The laptop campaigns use `jev-autoscaler-plugin/`, which does not have them |
 | `cluster/flink-job/` | The benchmark job built for Flink 2.x |
 | `cluster/deploy/` | Dockerfiles, `cluster.example.json`, and `make_conf.py`, which derives the cluster's settings and the test's own objects (operator, driver pod, service accounts) from a job that already runs in the namespace |
 | `cluster/build.sh` | Builds the three images: job, operator with the plugin, driver |
+
+Which plugin source ran which cluster test. The tests of the two fixes that the paper reports (the cap on
+the trend projection and the step-aware demand, 22 and 23 November 2026) ran with the plugin source of
+this repository's first commit (6f1a803). The source has changed since in three ways that no test in the
+paper has run: the reading of the end offsets within one cycle counts at the first step line of a rise
+only; at that line a third reading two seconds after the first replaces it (`lag.step-confirm-seconds`);
+and a scale-down that is kept for an earlier level gets a margin (`scale-down.window-keeps-margin`). The
+runs at the operator's default time settings switch on none of these options.
 
 Settings that `cluster/plugin` adds (under `job.autoscaler.jev.`) and the harness option that sets each for
 one job of a run:

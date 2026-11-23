@@ -346,7 +346,8 @@ public final class DecisionEngine {
      * {@link #trigger}. Scale down to {@link #size} when the vertex has at least two subtasks more
      * than that. Otherwise keep the current parallelism, because every change restarts the job.
      * With {@link JevConfig#scaleDownWindowSeconds} a scale-down is sized for the highest demand of
-     * that window, so a load that comes back within it does not cost two restarts.
+     * that window, so a load that comes back within it does not cost two restarts, and with
+     * {@link JevConfig#windowKeepsMargin} for that demand plus the cap's margin.
      */
     int ruleChoice(VertexSnapshot v, List<Integer> options) {
         int cur = v.parallelism;
@@ -355,7 +356,12 @@ public final class DecisionEngine {
             return fit(options, size);
         }
         // With a scale-down window the vertex keeps what the highest demand of that window needs.
-        int keep = Math.max(size, sizeAt(v, v.peakRate));
+        // With windowKeepsMargin it keeps what that demand plus the cap's margin needs: a returning
+        // demand up to the margin above the level still counts as the level, and one reading of a
+        // subtask's capacity moves by a few percent, so a size that just fits the level is undone
+        // when the load returns (ISSUES.md #119: 12 to 10 at a reading of 461 rec/s, 10 to 15 at 443).
+        double kept = cfg.windowKeepsMargin ? v.peakRate * (1 + cfg.windowCapMargin) : v.peakRate;
+        int keep = Math.max(size, sizeAt(v, kept));
         int down = fit(options, keep);
         return cur - keep >= 2 && down < cur ? down : cur;
     }

@@ -90,7 +90,8 @@ public class JevEvaluatorPlugin implements ScalingMetricsEvaluatorPlugin {
                     cfg.lagBootstrapServers.isEmpty() ? System.getenv("ARBITER_KAFKA_BOOTSTRAP") : cfg.lagBootstrapServers;
             lagFix =
                     BrokerLag.overrides(
-                            job, ctx, vertex, evaluatedMetrics, conf, brokers, cfg.lagAuth, now, cfg.lagStepAware, cfg.lagStepMargin);
+                            job, ctx, vertex, evaluatedMetrics, conf, brokers, cfg.lagAuth, now, cfg.lagStepAware, cfg.lagStepMargin,
+                            cfg.lagStepConfirmSeconds);
             if (!lagFix.isEmpty()) {
                 evaluatedMetrics = new HashMap<>(evaluatedMetrics);
                 evaluatedMetrics.putAll(lagFix);
