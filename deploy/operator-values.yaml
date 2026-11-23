@@ -1,0 +1,58 @@
+# Helm values for the Flink Kubernetes Operator with the Jev plugin.
+image:
+  repository: jev-operator
+  tag: dev
+  pullPolicy: IfNotPresent
+
+watchNamespaces:
+  - flink
+
+webhook:
+  create: false
+
+operatorPod:
+  env:
+    # The Jev plugin reads its API key from this variable. The value comes from a Secret that
+    # scripts/setup.sh creates from your shell's TYPESAFE_API_KEY.
+    - name: TYPESAFE_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: jev-api-key
+          key: api-key
+          optional: true
+    # Used when a job sets job.autoscaler.jev.provider: anthropic (a Claude model decides).
+    - name: ANTHROPIC_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: anthropic-api-key
+          key: api-key
+          optional: true
+    # Used when a job sets job.autoscaler.jev.lag.source: broker. The plugin then reads the end
+    # offsets of the job's Kafka source from this cluster. It is an operator-level setting on
+    # purpose: a job cannot make the operator connect to an address of its own choosing.
+    - name: ARBITER_KAFKA_BOOTSTRAP
+      value: kafka.kafka.svc:9092
+    # Benchmark only: lets bench/bench.py --fault simulate an outage of the model provider by writing
+    # "error" or "hang" into this file inside the operator pod. Leave it out in a real deployment.
+    - name: ARBITER_FAULT_FILE
+      value: /tmp/arbiter-fault
+  resources:
+    requests:
+      cpu: 250m
+      memory: 768Mi
+    limits:
+      memory: 1200Mi
+
+# In kind on Rancher Desktop, IPv6 (AAAA) DNS lookups for external hosts time out after about
+# 6 seconds, which made every uncached Jev call hit its timeout. IPv4-only avoids the AAAA lookup.
+jvmArgs:
+  operator: "-Djava.net.preferIPv4Stack=true"
+
+defaultConfiguration:
+  create: true
+  append: true
+  flink-conf.yaml: |+
+    kubernetes.operator.metrics.reporter.slf4j.factory.class: org.apache.flink.metrics.slf4j.Slf4jReporterFactory
+    kubernetes.operator.metrics.reporter.slf4j.interval: 60 MINUTE
+    kubernetes.operator.reconcile.interval: 15 s
+    kubernetes.operator.observer.progress-check.interval: 5 s

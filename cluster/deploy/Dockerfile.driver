@@ -1,0 +1,11 @@
+# The harness of the cluster test: bench.py and scenarios.py of the laptop harness (unchanged),
+# cluster/bench/bench_cluster.py, the two Kafka clients and kubectl. Runs as a non-root user.
+FROM python:3.12-slim
+ADD --chmod=755 https://dl.k8s.io/release/v1.36.5/bin/linux/amd64/kubectl /usr/local/bin/kubectl
+RUN pip install --no-cache-dir kafka-python==2.3.0 confluent-kafka==2.6.1 botocore aws-msk-iam-sasl-signer-python
+COPY bench/ /opt/asbench/
+RUN mkdir -p /results /home/asbench && chown -R 1000:1000 /results /home/asbench /opt/asbench
+ENV HOME=/home/asbench PYTHONUNBUFFERED=1
+USER 1000
+WORKDIR /opt/asbench
+CMD ["sleep", "infinity"]
