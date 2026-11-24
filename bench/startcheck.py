@@ -24,7 +24,18 @@ def keep_warming(elapsed, warmup, drain_max, ready):
     return elapsed < warmup or (not ready and elapsed < warmup + drain_max)
 
 
-def jobs_ready(drained, settled, at_scenario_size, wait_for_size):
+def state_filled(state_bytes, wanted, share=0.97):
+    """Whether every job that is to hold state has it in a completed checkpoint.
+    state_bytes: job -> full size of its latest completed checkpoint, None when not known.
+    wanted: job -> the bytes of state the job is to hold (0: none). A restore in the measured phase
+    brings back what the last checkpoint holds, so a run must not begin before that is the whole state.
+    The job writes a key's state with the key's first records, so the last keys finish late: the
+    check asks for nearly all of it, not for the last byte."""
+    return all((state_bytes.get(job) or 0) >= share * want for job, want in wanted.items() if want > 0)
+
+
+def jobs_ready(drained, settled, at_scenario_size, wait_for_size, state_filled=True):
     """The warm-up's end condition. The size is waited for only when the run asks for it, so that the
-    warm-up of campaigns that ran before this check stays what it was."""
-    return bool(drained and settled and (at_scenario_size or not wait_for_size))
+    warm-up of campaigns that ran before this check stays what it was. Jobs that hold state are also
+    waited for until the state is filled."""
+    return bool(drained and settled and (at_scenario_size or not wait_for_size) and state_filled)

@@ -41,7 +41,7 @@ from kafka.admin import NewTopic
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scenarios  # noqa: E402
 from pacing import Pacer, parse_burst  # noqa: E402
-from startcheck import jobs_ready, keep_warming, start_state  # noqa: E402
+from startcheck import jobs_ready, keep_warming, start_state, state_filled  # noqa: E402
 from scenarios import HOT_KEYS, MEASURE_COST, NUM_KEYS, SCENARIOS  # noqa: E402
 
 # The broker advertises localhost:9094, and that port is forwarded to the cluster on IPv4 only. When
@@ -161,8 +161,10 @@ SOURCE_VERTEX = "e5a72f353fc1e6bbf3bd96a41384998c"
 #                                     with it does not build a backlog in the warm-up (Issue #146)
 #   +advc +advl +advd                 marks the job as advised by an advisor outside the sizing loop: rules
 #                                     in code, an LLM or a decision model. Changes nothing in the job itself.
+#   +stN                              real state: N GiB of keyed state across the job's keys, in RocksDB
+#                                     with incremental checkpoints, so that a restart restores it for real
 #   +a ... +h                         a tag, to run several identical jobs side by side
-SPEC = re.compile(r"(builtin|rule|jev|llm)((\+(max\d\d|min\d\d|t\d\d|rt\d+|sonnet|opus|fable|f\d+|sp\d+|agg\d+|off|noplugin|lagfix|rd\d+|rr\d+|advc|advl|advd|[a-h]))*)")
+SPEC = re.compile(r"(builtin|rule|jev|llm)((\+(max\d\d|min\d\d|t\d\d|rt\d+|sonnet|opus|fable|f\d+|sp\d+|agg\d+|off|noplugin|lagfix|rd\d+|rr\d+|st\d+|advc|advl|advd|[a-h]))*)")
 
 
 def options(job):
@@ -172,6 +174,21 @@ def options(job):
         m = re.fullmatch(r"([a-z]+?)(\d+)", o)
         out[m.group(1) if m else o] = int(m.group(2)) if m else True
     return out
+
+
+KEYS = NUM_KEYS  # how many keys the load uses; the cluster harness has more at a larger scale and says so here
+
+
+def state_wanted(job):
+    """Bytes of keyed state a job is to hold (+stN: N GiB), 0 for a job without the option."""
+    return options(job).get("st", 0) * 2**30
+
+
+def checkpoint_bytes(doc):
+    """The full size of a job's latest completed checkpoint from Flink's /jobs/:id/checkpoints, None
+    when there is none. That is what a restore brings back."""
+    completed = (doc.get("latest") or {}).get("completed") or {}
+    return completed.get("state_size")
 
 
 def safe(job):
@@ -262,6 +279,9 @@ def job_args(job, run_id, scenario=None):
         args += ["--restore-delay-ms", str(o["rd"] * 1000)]
     if "rr" in o:
         args += ["--restore-delay-ms", str(o["rr"] * 1000), "--restore-delay-first-start", "false"]
+    if "st" in o:
+        # Every key gets the same share. The job writes it when it first sees the key.
+        args += ["--ballast-bytes-per-key", str(state_wanted(job) // KEYS)]
     return args
 
 
@@ -311,6 +331,11 @@ def deployment(job, run_id, jev_overrides=None, scenario=None):
         "restart-strategy.fixed-delay.delay": "2s",
     }
     conf.update(autoscaler_conf(job, jev_overrides))
+    if state_wanted(job):
+        # Gigabytes of state do not fit a heap of this size, and a checkpoint every 10 s can only
+        # carry what changed.
+        conf["state.backend.type"] = "rocksdb"
+        conf["execution.checkpointing.incremental"] = "true"
     volume = {"name": "flink-data", "persistentVolumeClaim": {"claimName": "flink-data"}}
     mount = {"name": "flink-data", "mountPath": "/flink-data"}
     return {
@@ -466,6 +491,11 @@ class LoadGenerator(threading.Thread):
 class LatencyCollector(threading.Thread):
     """Reads the per-second latency summaries both jobs write to their output topics."""
 
+    # After the stop flag it keeps reading for at most this long. A job that is still working off a backlog
+    # never leaves a quiet second, and the harness rewrites the file once it has waited 30 s for this thread
+    # (ISSUES.md #177), so this must stay well below 30.
+    GRACE_S = 20
+
     def __init__(self, run_id, out_path):
         super().__init__(daemon=True)
         self.run_id, self.out_path = run_id, out_path
@@ -479,14 +509,20 @@ class LatencyCollector(threading.Thread):
         with open(self.out_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["job", "t", "subtask", "count", "p50_ms", "p95_ms", "p99_ms", "max_ms"])
-            quiet = 0
+            quiet, stop_by = 0, None
             while quiet < 3:
                 got = False
                 for msg in consumer:
                     got = True
                     p = msg.value.decode().split(",")
                     w.writerow([topics[msg.topic], round(int(p[0]) / 1000, 1)] + p[1:])
+                    if self.stop_flag.is_set():
+                        stop_by = stop_by or time.time() + self.GRACE_S
+                        if time.time() > stop_by:
+                            break
                 f.flush()
+                if stop_by and time.time() > stop_by:
+                    break
                 quiet = quiet + 1 if (self.stop_flag.is_set() and not got) else 0
         consumer.close()
 
@@ -496,7 +532,8 @@ class Sampler(threading.Thread):
 
     FIELDS = ["t", "job", "state", "tm_pods", "end_offset", "committed_offset", "position_offset",
               "pending_records", "fetch_rate"] + [
-        f"{m}_{v}" for v in VERTICES for m in ("p", "target_p", "busy", "backpressure", "in_rate", "out_rate")]
+        f"{m}_{v}" for v in VERTICES for m in ("p", "target_p", "busy", "backpressure", "in_rate", "out_rate")] + [
+        "state_bytes"]
 
     def __init__(self, run_id, job_ids, out_path):
         super().__init__(daemon=True)
@@ -509,6 +546,8 @@ class Sampler(threading.Thread):
         # Per job: its last (state, parallelisms) and when that last changed.
         self.shape = {job: None for job in JOBS}
         self.changed = {job: time.time() for job in JOBS}
+        # Per job: the full size of its latest completed checkpoint at the newest sample (jobs with +stN).
+        self.state = {job: None for job in JOBS}
 
     def settled(self, seconds):
         """True when every job has been running at an unchanged parallelism for `seconds`: stabilization
@@ -524,6 +563,10 @@ class Sampler(threading.Thread):
 
     def lags(self):
         return {job: (r[-1][1] if r else None) for job, r in self.recent.items()}
+
+    def state_bytes(self):
+        """The full size of each job's latest completed checkpoint at its newest sample, None when not known."""
+        return dict(self.state)
 
     def sizes(self):
         """(Aggregate, Measure) parallelism of each job from its newest sample, None when not known."""
@@ -574,6 +617,14 @@ class Sampler(threading.Thread):
                 pass
             detail = flink(job, f"/jobs/{jid}")
             row["state"] = detail["state"]
+            if state_wanted(job):
+                self.state[job] = None  # a reading that fails leaves the size unknown
+                try:
+                    self.state[job] = checkpoint_bytes(flink(job, f"/jobs/{jid}/checkpoints"))
+                except Exception:
+                    pass
+                if self.state[job] is not None:
+                    row["state_bytes"] = self.state[job]
             for v in detail["vertices"]:
                 k = self.vertex_key(v["name"])
                 row[f"p_{k}"] = v["parallelism"]
@@ -763,16 +814,21 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
         limit = s.rate(0) * 20 + 1000
         initial = {j: initial_parallelism(s, autoscaler_conf(j, jev_overrides)) for j in JOBS}
         wanted = {j: start_sizes(j, s, jev_overrides) for j in JOBS}  # differs from `initial` for +aggN and +off
+        wanted_state = {j: state_wanted(j) for j in JOBS}
 
         def ready():
             at_size = start_state(sampler.sizes(), wanted)["at_scenario_size"]
-            return jobs_ready(sampler.drained(limit), sampler.settled(SETTLE_S), at_size, START_WAIT)
+            return jobs_ready(sampler.drained(limit), sampler.settled(SETTLE_S), at_size, START_WAIT,
+                              state_filled(sampler.state_bytes(), wanted_state))
 
         while load.is_alive() and keep_warming(time.time() - base, s.warmup, DRAIN_MAX, ready()):
             time.sleep(5)
         drained, settled, lag_at_t0 = sampler.drained(limit), sampler.settled(SETTLE_S), sampler.lags()
         start_at_t0 = start_state(sampler.sizes(), wanted)
         start_at_t0["waited_for"] = START_WAIT
+        # Jobs with real state: what the last completed checkpoint of each held when the measured phase began.
+        state_at_t0 = {"wanted": wanted_state, "bytes": sampler.state_bytes(),
+                       "filled": state_filled(sampler.state_bytes(), wanted_state)} if any(wanted_state.values()) else None
         clock.t0 = t0 = time.time() + 5
         print(f"    warm-up {t0 - base:.0f}s, drained={drained}, settled={settled}, shift={shift}s, lag={lag_at_t0}, "
               f"at scenario size={start_at_t0['at_scenario_size']}, equal={start_at_t0['equal']}, sizes={start_at_t0['sizes']}", flush=True)
@@ -840,7 +896,7 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
             "scenario": name, "title": s.title, "rep": rep, "run_id": run_id,
             "t0_epoch": t0, "duration": s.duration, "warmup": round(t0 - base), "warmup_planned": s.warmup,
             "drained": drained, "settled": settled, "lag_at_t0": lag_at_t0, "events": [e + shift for e in s.events], "shift": shift,
-            "initial_parallelism": initial, "start": start_at_t0, "burst": list(BURST) if BURST else None,
+            "initial_parallelism": initial, "start": start_at_t0, "state": state_at_t0, "burst": list(BURST) if BURST else None,
             "metric_refresh": METRIC_REFRESH_S,
             "source_parallelism": SOURCE_PARALLELISM, "record_bytes": RECORD_BYTES, "partitions": PARTITIONS,
             "fault": fault_times,

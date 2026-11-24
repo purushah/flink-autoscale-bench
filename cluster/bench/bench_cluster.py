@@ -46,7 +46,7 @@ import bench  # noqa: E402  the laptop harness
 import scenarios  # noqa: E402
 from bench import safe  # noqa: E402
 from pacing import Pacer, parse_burst  # noqa: E402
-from startcheck import jobs_ready, keep_warming, start_state  # noqa: E402
+from startcheck import jobs_ready, keep_warming, start_state, state_filled  # noqa: E402
 
 # bench.py resolves names to IPv4 only, for a quirk of the laptop. Not wanted in a cluster.
 socket.getaddrinfo = bench._getaddrinfo
@@ -67,6 +67,16 @@ NO_EVENT = False
 # "long": the five-minute metric window and its companions (--windows long), written to meta.json.
 # "default": the operator's own defaults for the five time settings the harness shortens.
 WINDOWS = "short"
+# --apart: the pods of each job keep off every node that holds a pod of another job of the run. While
+# one job with real state restored it, the other job's TaskManagers on the same node waited for the
+# node's disk three quarters of the time (first forty-minute run with state, 24 Nov): jobs that are
+# compared must not share a disk. Written to meta.json.
+APART = False
+# --alone: every Flink pod of the run on a node of its own, also against the pods of its own job. Jobs
+# apart is not enough: the four TaskManagers of one job on one node waited for its disk 60 to 80% of a
+# forty-minute run, while the other job's, on four nodes, waited next to never (24 Nov). Which job gets
+# packed is the scheduler's doing. Written to meta.json.
+ALONE = False
 # The sustained overload for --windows default: the load rises 23 minutes after the jobs run, so that every
 # job has had its stabilization interval (5 minutes) and one full metric window (15 minutes) before, stays
 # high for 90 minutes (a decision after a rescale needs 20 minutes), and falls back for the last 8.
@@ -157,10 +167,36 @@ def deployment(job, run_id, jev_overrides=None, scenario=None):
     containers = pod.setdefault("containers", [])
     if not any(c.get("name") == "flink-main-container" for c in containers):
         containers.insert(0, {"name": "flink-main-container"})
+    if APART or ALONE:
+        # Required, not preferred: a pod that finds no node of its own waits for a new one.
+        others = [{"key": LABEL, "operator": "In", "values": [LABEL_VALUE]},
+                  {"key": "type", "operator": "In", "values": ["flink-native-kubernetes"]}]
+        if not ALONE:
+            others.append({"key": "app", "operator": "NotIn", "values": [d["metadata"]["name"]]})
+        pod.setdefault("affinity", {}).setdefault("podAntiAffinity", {}).setdefault(
+            "requiredDuringSchedulingIgnoredDuringExecution", []).append(
+                {"labelSelector": {"matchExpressions": others}, "topologyKey": "kubernetes.io/hostname"})
     spec["podTemplate"] = template
     for role in ("jobManager", "taskManager"):
         if role in CONF.get("resources", {}):
-            spec[role]["resource"] = CONF["resources"][role]
+            spec[role]["resource"] = dict(CONF["resources"][role])
+    if bench.state_wanted(job):
+        # A job with real state (+stN): memory for RocksDB beside the heap, and local disk for the state.
+        # After a rescale every subtask downloads the whole state of the subtask it descends from and
+        # then drops what is not its own. A job that starts with two subtasks so puts twice its state
+        # on a TaskManager of four slots, beside what the TaskManager held before; six times the state
+        # leaves room for that and for RocksDB's own copies (16 GB were not enough for 8 GiB of state:
+        # the pod was evicted, fourth smoke run).
+        # Two CPUs: the job's own work is simulated and needs none, but RocksDB's compactions and a
+        # restore's downloads do, and on half a CPU they held the records up (first smoke run, 23 Nov).
+        # Memory: RocksDB reads and writes its files through the operating system's cache, which counts
+        # against the pod. With 2 GiB, all of it Flink's, the pod sat at its limit and RocksDB stalled
+        # its writes (third smoke run). Half of 6 GiB is kept out of Flink's hands as JVM overhead.
+        spec["taskManager"]["resource"]["memory"] = "6144m"
+        spec["taskManager"]["resource"]["cpu"] = 2
+        conf["taskmanager.memory.jvm-overhead.min"] = conf["taskmanager.memory.jvm-overhead.max"] = "3072m"
+        conf["state.backend.rocksdb.thread.num"] = "4"  # flushes and compactions (default 2)
+        spec["taskManager"]["resource"]["ephemeralStorage"] = f"{6 * bench.options(job)['st']}G"
     spec["job"]["args"] += ["--brokers", CONF["brokers"], "--latency-limit-ms", str(CONF.get("latency_limit_ms", 2000))]
     if CONF.get("sink_guarantee"):  # "none": the latency summaries do not hold up a checkpoint
         spec["job"]["args"] += ["--sink-guarantee", CONF["sink_guarantee"]]
@@ -562,10 +598,12 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
         limit = s.rate(0) * 20 + 1000
         initial = {j: bench.initial_parallelism(s, bench.autoscaler_conf(j, jev_overrides)) for j in jobs}
         wanted = {j: bench.start_sizes(j, s, jev_overrides) for j in jobs}  # differs from `initial` for +aggN and +off
+        wanted_state = {j: bench.state_wanted(j) for j in jobs}
 
         def ready():
             at_size = start_state(sampler.sizes(), wanted)["at_scenario_size"]
-            return jobs_ready(sampler.drained(limit), sampler.settled(bench.SETTLE_S), at_size, bench.START_WAIT)
+            return jobs_ready(sampler.drained(limit), sampler.settled(bench.SETTLE_S), at_size, bench.START_WAIT,
+                              state_filled(sampler.state_bytes(), wanted_state))
 
         if planned:
             # The start is fixed, because the jobs were told when the load changes.
@@ -581,6 +619,9 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
         # starts at its fixed moment and only records it.
         start_at_t0 = start_state(sampler.sizes(), wanted)
         start_at_t0["waited_for"] = bool(bench.START_WAIT and not planned)
+        # Jobs with real state: what the last completed checkpoint of each held when the measured phase began.
+        state_at_t0 = {"wanted": wanted_state, "bytes": sampler.state_bytes(),
+                       "filled": state_filled(sampler.state_bytes(), wanted_state)} if any(wanted_state.values()) else None
         clock.t0 = t0 = planned["t0_epoch"] if planned else time.time() + 5
         print(f"    warm-up {t0 - base:.0f}s, drained={drained}, settled={settled}, shift={shift}s, lag={lag_at_t0}, "
               f"at scenario size={start_at_t0['at_scenario_size']}, equal={start_at_t0['equal']}, sizes={start_at_t0['sizes']}", flush=True)
@@ -649,7 +690,7 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
             "duration": s.duration, "warmup": round(t0 - base), "warmup_planned": s.warmup,
             "drained": drained, "settled": settled, "lag_at_t0": lag_at_t0,
             "events": [e + shift for e in s.events], "shift": shift,
-            "initial_parallelism": initial, "start": start_at_t0, "burst": list(bench.BURST) if bench.BURST else None,
+            "initial_parallelism": initial, "start": start_at_t0, "state": state_at_t0, "burst": list(bench.BURST) if bench.BURST else None,
             "metric_refresh": bench.METRIC_REFRESH_S, "partitions": bench.PARTITIONS, "key_groups": bench.KEY_GROUPS,
             "source_parallelism": bench.SOURCE_PARALLELISM, "record_bytes": 0, "fault": None,
             "records_sent": load.sent, "started_utc": started_utc, "fetch_bytes": bench.FETCH_BYTES,
@@ -660,7 +701,7 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
             "flink_deployments": {j: f"bench-{safe(j)}" for j in jobs},
             "arms": ARMS, "arm_conf": {j: sorted(c) for j, c in ARM_CONF.items()},
             "planned": dict(planned, note=note_text(planned)) if planned else None,
-            "no_event": NO_EVENT, "windows": WINDOWS,
+            "no_event": NO_EVENT, "windows": WINDOWS, "apart": APART, "alone": ALONE,
             "notes": {j: note_text(planned, note_kind(f)) for j, fs in ARMS.items() for f in fs if note_kind(f)} if planned else None,
             "job_image": CONF["job_image"],
             "latency_coverage": coverage, "latency_last_t": last_latency, "taskmanager_fatal": fatal,
@@ -681,7 +722,7 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
 
 
 def main():
-    global CONF, SCALE, PRODUCER_LOGIN, PLANNED, NO_EVENT, WINDOWS
+    global CONF, SCALE, PRODUCER_LOGIN, PLANNED, NO_EVENT, WINDOWS, APART, ALONE
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run one scenario once")
@@ -717,6 +758,15 @@ def main():
         sp.add_argument("--start-wait", action="store_true",
                         help="the warm-up also waits until every job runs at the scenario's size, inside its usual "
                              "bound; without it the state is only recorded in meta.json as 'start' (as bench.py)")
+        sp.add_argument("--apart", action="store_true",
+                        help="the pods of each job keep off the nodes that hold pods of the run's other jobs "
+                             "(required pod anti-affinity), so that jobs with real state do not share a disk")
+        sp.add_argument("--alone", action="store_true",
+                        help="every Flink pod of the run on a node of its own (required pod anti-affinity against "
+                             "all Flink pods of this harness), so that every TaskManager has a disk to itself")
+        sp.add_argument("--drain-max", type=int, default=None, metavar="SECONDS",
+                        help="longest extra warm-up spent waiting for the jobs to be ready (default: the laptop "
+                             "harness's 240 s); jobs with real state (+stN) need longer, they write it in the warm-up")
         sp.add_argument("--windows", choices=["short", "long", "default"], default="short",
                         help="long: 5-minute metric window, 2-minute stabilization, 10-minute scale-down interval, "
                              "5-minute catch-up, and the plugin's cooldown and look-ahead scaled alike (as bench.py); "
@@ -726,6 +776,7 @@ def main():
 
     CONF = load_conf(args.conf)
     SCALE = args.scale
+    bench.KEYS = scenarios.NUM_KEYS * SCALE  # as the load generator below: a job with state divides it over them
     bench.CTX = CONF.get("context", KUBE_CONTEXT)
     bench.NS = CONF["namespace"]
     bench.BROKERS = CONF["brokers"]
@@ -735,6 +786,8 @@ def main():
         raise SystemExit(f"unknown or repeated job in --jobs {args.jobs}")
     bench.JITTER, bench.FETCH_BYTES = args.jitter, args.fetch_bytes
     bench.START_WAIT = args.start_wait
+    if args.drain_max is not None:
+        bench.DRAIN_MAX = args.drain_max
     if args.burst:
         try:
             bench.BURST = parse_burst(args.burst)
@@ -753,6 +806,8 @@ def main():
         raise SystemExit("note and schedule need --planned")
     bench.SOURCE_PARALLELISM = args.source_parallelism * SCALE or None
     WINDOWS = args.windows
+    APART = args.apart
+    ALONE = args.alone
     if WINDOWS == "default":
         # The operator's defaults (AutoScalerOptions of 1.16) for the settings the harness shortens. The
         # policy and the models have cooldowns and a look-ahead that were never set for these, so only

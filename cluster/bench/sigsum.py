@@ -38,13 +38,21 @@ def collapse(p):
     return [(b[0], a[2], b[2]) for a, b in zip(merged, merged[1:])]
 
 
+def latency_rows(path):
+    """The rows of a latency file, with zero bytes dropped. When a job still emits at the end of a run the
+    harness can rewrite the file under its collector, which then leaves a block of zero bytes before rows
+    whose times are still epoch seconds (ISSUES.md #177). Those rows lie outside every window."""
+    with open(path, newline="") as f:
+        yield from csv.DictReader(line.replace("\0", "") for line in f)
+
+
 def harness(d):
     m = json.load(open(os.path.join(d, "meta.json")))
     dur, ev = m["duration"], m["events"]
     peak = max(float(r["target_rate"]) for r in csv.DictReader(open(os.path.join(d, "load.csv"))) if r.get("target_rate"))
     need = math.ceil(peak / NOMINAL)
     lat = collections.defaultdict(lambda: collections.defaultdict(list))
-    for r in csv.DictReader(open(os.path.join(d, "latency.csv"))):
+    for r in latency_rows(os.path.join(d, "latency.csv")):
         t = float(r["t"])
         if 0 <= t <= dur:
             lat[r["job"]][int(t)].append(float(r["p95_ms"]))
@@ -83,11 +91,24 @@ def interval(x):
     return float(x.mean()), float(x.mean() - half), float(x.mean() + half)
 
 
+def _seconds(text):
+    """A Flink duration such as 30s, 1m or 5 min, in seconds."""
+    import re
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([a-z]*)\s*", str(text).lower())
+    unit = m.group(2)
+    return float(m.group(1)) * (60 if unit.startswith("m") and unit != "ms" else 3600 if unit.startswith("h") else 1)
+
+
 def formula_sizes(runs, cap=16):
-    """What the rule's formula asked for against the maximum, per job-run with the broker-side signal:
-    (first size above the maximum while Aggregate still ran below it, seconds after the rise at that
-    evaluation, largest size after the rise). The plugin logs the formula's size at every evaluation
-    (rule_size in decisions.jsonl: Equation 1 with the restart term, before the maximum is applied)."""
+    """What the built-in rule's formula (the paper's Equation 1) asked for against the maximum, per
+    job-run with the broker-side signal: (first size above the maximum while Aggregate still ran below
+    it, seconds after the rise at that evaluation, largest size after the rise).
+
+    The size is computed here from what the plugin logs at every evaluation (demand, backlog, capacity
+    per subtask in decisions.jsonl) and the job's own settings: (demand / target + demand * restart time /
+    catch-up time + backlog / catch-up time) / capacity per subtask. Until 23 Nov 2026 this function read
+    the plugin's rule_size instead. That is the policy's size, which projects a rising demand ahead, and
+    during a rise it is well above Equation 1 (20 to 50 where Equation 1 gives 13 to 35; ISSUES.md #165)."""
     import calendar, time
     out = []
     for d in runs:
@@ -96,6 +117,7 @@ def formula_sizes(runs, cap=16):
             continue
         meta = json.load(open(os.path.join(d, "meta.json")))
         rise = meta["t0_epoch"] + meta["events"][0]
+        names = {v: k for k, v in meta["flink_deployments"].items()}
         per_job = collections.defaultdict(list)
         for line in open(path):
             if not line.strip():
@@ -104,11 +126,15 @@ def formula_sizes(runs, cap=16):
             job = r["job"].split("name='")[1].split("'")[0] if "name='" in r.get("job", "") else r.get("job", "")
             if "lagfix" not in job:
                 continue
+            conf = meta["jobs_conf"][names[job]]
+            target = float(conf["job.autoscaler.utilization.target"])
+            restart, catch_up = _seconds(conf["job.autoscaler.restart.time"]), _seconds(conf["job.autoscaler.catch-up.duration"])
             ts = r["ts"]
             t = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) + float("0." + (ts[20:].rstrip("Z") or "0")) - rise
             for v in (r.get("vertices") or {}).values():
-                if v.get("name") == "Aggregate" and v.get("rule_size") is not None and t >= 0:
-                    per_job[job].append((t, v["current"], v["rule_size"]))
+                if v.get("name") == "Aggregate" and v.get("demand") is not None and v.get("capacity_per_subtask") and t >= 0:
+                    need = v["demand"] / target + v["demand"] * restart / catch_up + max(0.0, v.get("backlog") or 0.0) / catch_up
+                    per_job[job].append((t, v["current"], math.ceil(need / v["capacity_per_subtask"] - 1e-9)))
         for job, rows in sorted(per_job.items()):
             first = next(((size, t) for t, cur, size in rows if cur < cap and size > cap), None)
             if first:

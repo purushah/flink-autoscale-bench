@@ -2,6 +2,8 @@ package dev.jevscaler.job;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.java.utils.ParameterTool;
@@ -116,6 +118,10 @@ public final class BenchJob {
         long restoreDelayMs = params.getLong("restore-delay-ms", 0);
         // false: the delay applies only when the job restores from a checkpoint, not on its first start.
         boolean restoreDelayFirstStart = params.getBoolean("restore-delay-first-start", true);
+        // Real state: every key holds this many bytes, written with the key's first records (0: none).
+        long ballastBytesPerKey = params.getLong("ballast-bytes-per-key", 0);
+        int ballastEntryBytes = params.getInt("ballast-entry-bytes", 4096);
+        int ballastEntriesPerRecord = params.getInt("ballast-entries-per-record", 16);
 
         var raw = env.fromSource(source, WatermarkStrategy.noWatermarks(), "Source").uid("source");
         if (sourcePar > 0) {
@@ -126,7 +132,10 @@ public final class BenchJob {
             parsed.setParallelism(sourcePar);
         }
         var aggregated =
-                parsed.keyBy(e -> e.key).process(new Aggregate(restoreDelayMs, restoreDelayFirstStart)).name("Aggregate").uid("aggregate");
+                parsed.keyBy(e -> e.key)
+                        .process(new Aggregate(restoreDelayMs, restoreDelayFirstStart, ballastBytesPerKey, ballastEntryBytes, ballastEntriesPerRecord))
+                        .name("Aggregate")
+                        .uid("aggregate");
         if (aggPar > 0) {
             aggregated.setParallelism(aggPar);
         }
@@ -151,17 +160,67 @@ public final class BenchJob {
         return (restored || firstStartToo) && delayMs > 0 ? delayMs : 0;
     }
 
+    /**
+     * Real state of a key: a fixed number of entries of a fixed size. Aggregate writes them with the
+     * key's first records, a few with each, and reads one of the first few on every record. Most of the state is
+     * cold, as in a job with a large state, but a restore has to bring all of it back. The bytes do
+     * not compress, so the size on disk and in a checkpoint is the size asked for.
+     */
+    static final class Ballast {
+        private Ballast() {}
+
+        /** How many entries of {@code entryBytes} hold at least {@code bytesPerKey}; 0 when no state is asked for. */
+        static int entries(long bytesPerKey, int entryBytes) {
+            return bytesPerKey <= 0 ? 0 : (int) ((bytesPerKey + entryBytes - 1) / entryBytes);
+        }
+
+        /** The content of one entry: the same for the same key and index, different otherwise. */
+        static byte[] entry(String key, int index, int entryBytes) {
+            byte[] bytes = new byte[entryBytes];
+            new java.util.Random(key.hashCode() * 1_000_003L + index).nextBytes(bytes);
+            return bytes;
+        }
+
+        /** A key's records read this many of its entries; the rest is state that is kept and restored but cold. */
+        static final int HOT = 8;
+
+        /**
+         * The entries the n-th record of a key writes, as [from, to): {@code perRecord} with each of the
+         * key's first records until all are written, and at least the ones its records read with the
+         * first. Writing a key's state at once stalled RocksDB for minutes (second smoke run, 23 Nov).
+         */
+        static int[] fillRange(long recordOfKey, int entries, int perRecord) {
+            long step = Math.max(perRecord, HOT);
+            long from = Math.min((recordOfKey - 1) * step, entries);
+            return new int[] {(int) from, (int) Math.min(from + step, entries)};
+        }
+
+        /** Which entry the n-th record of a key reads: its first {@link #HOT} entries in turn. */
+        static int slot(long recordOfKey, int entries) {
+            return (int) Math.floorMod(recordOfKey, (long) Math.min(entries, HOT));
+        }
+    }
+
     /** Keeps a running count and sum per key and spends the record's simulated cost. */
     static final class Aggregate extends KeyedProcessFunction<String, Event, Event> implements CheckpointedFunction {
         private final long restoreDelayMs;
         private final boolean restoreDelayFirstStart;
+        private final long ballastBytesPerKey;
+        private final int ballastEntryBytes;
+        private final int ballastEntriesPerRecord;
         private transient boolean restored;
         private transient ValueState<long[]> totals;
+        private transient MapState<Integer, byte[]> ballast;
+        private transient int ballastEntries;
         private transient Pacer pacer;
 
-        Aggregate(long restoreDelayMs, boolean restoreDelayFirstStart) {
+        Aggregate(
+                long restoreDelayMs, boolean restoreDelayFirstStart, long ballastBytesPerKey, int ballastEntryBytes, int ballastEntriesPerRecord) {
             this.restoreDelayMs = restoreDelayMs;
             this.restoreDelayFirstStart = restoreDelayFirstStart;
+            this.ballastBytesPerKey = ballastBytesPerKey;
+            this.ballastEntryBytes = ballastEntryBytes;
+            this.ballastEntriesPerRecord = ballastEntriesPerRecord;
         }
 
         @Override
@@ -175,6 +234,10 @@ public final class BenchJob {
         @Override
         public void open(Configuration parameters) throws Exception {
             totals = getRuntimeContext().getState(new ValueStateDescriptor<>("totals", long[].class));
+            ballastEntries = Ballast.entries(ballastBytesPerKey, ballastEntryBytes);
+            if (ballastEntries > 0) {
+                ballast = getRuntimeContext().getMapState(new MapStateDescriptor<>("ballast", Integer.class, byte[].class));
+            }
             pacer = new Pacer();
             long delay = delayFor(restored, restoreDelayFirstStart, restoreDelayMs);
             if (delay > 0) {
@@ -194,6 +257,16 @@ public final class BenchJob {
             t[0]++;
             t[1] += e.seq;
             totals.update(t);
+            if (ballastEntries > 0) {
+                // The key's first records write its state, a few entries each; every record reads one.
+                int[] write = Ballast.fillRange(t[0], ballastEntries, ballastEntriesPerRecord);
+                for (int i = write[0]; i < write[1]; i++) {
+                    ballast.put(i, Ballast.entry(ctx.getCurrentKey(), i, ballastEntryBytes));
+                }
+                if (ballast.get(Ballast.slot(t[0], ballastEntries)) == null) {
+                    throw new IllegalStateException("state of key " + ctx.getCurrentKey() + " is incomplete");
+                }
+            }
             // Latency is measured from the broker's append time (the topic uses LogAppendTime), so
             // the load generator's clock does not matter.
             Long appendTime = ctx.timestamp();

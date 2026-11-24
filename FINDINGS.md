@@ -974,14 +974,20 @@ Reported without tests:
 
 - Slots held: 12.8 against 10.2 with the shipped band (+2.6 [1.5, 3.7]) and 12.8 against 9.9 with the band
   at the target (+2.9 [2.3, 3.5]). The broker-side jobs run at 16 subtasks for most of the overload.
-  These slots are a floor for the price of the fix: 16 is the maximum, and the rule's formula asked for
-  more. The plugin logs the formula's size at every evaluation, before the maximum is applied
-  (`rule_size` in `decisions.jsonl`). When that size first passed 16 while Aggregate still ran below it,
-  it was 20 to 23 subtasks in the twelve job-runs with one step (28 to 34 s after the rise) and 48 to 50
-  in the four job-runs with the early small step (114 to 116 s after it); the median of the 16 is 21. It
-  peaked at 31 to 50. With five-minute windows (next subsection) it was 41 to 43 in all twelve job-runs.
-  Not planned; `python3 cluster/bench/sigsum.py results-cluster/signal surge` prints it (added 22 Nov, after
-  review round 3 asked for it).
+  These slots were paid under a maximum of 16, and the rule's formula asked for more. The size is
+  computed from what the plugin logs at every evaluation (demand, backlog, capacity per subtask in
+  `decisions.jsonl`) with the paper's Equation 1: demand over the target utilization, plus the demand
+  during a restart and the backlog, both over the catch-up time. When that size first passed 16 while
+  Aggregate still ran below it, it was 19 to 22 subtasks in the twelve job-runs with one step (44 to 50 s
+  after the rise) and 33 to 35 in the four job-runs with the early small step (114 to 116 s after it); the
+  median of the 16 is 20. It peaked at 25 to 39. With five-minute windows (next subsection) it was 26 to
+  27 in all twelve job-runs. Not planned; `python3 cluster/bench/sigsum.py results-cluster/signal surge`
+  prints it (added 22 Nov, after review round 3 asked for it).
+  **Corrected on 23 Nov.** Until then this item, and the paper, gave 20 to 50 (median 21), 31 to 50 at
+  the peak and 41 to 43 with five-minute windows. Those were the plugin's `rule_size`, which is the
+  policy's size: it projects a rising demand ahead and was twice the logged demand at these evaluations.
+  It also called the slots "a floor for the price". The capped runs cannot show that: with a higher
+  maximum a larger first step holds more slots and works the backlog off sooner (`ISSUES.md` #165).
 - Scale-ups of Aggregate: 1.25 against 2.75 and 1.25 against 3.00. The default-signal job needed three
   steps in 6 of 8 runs with the shipped band and in 8 of 8 with the band at the target. The broker-side
   job needed one step in 6 of 8 runs in each band and two in the other 2.
@@ -1155,8 +1161,8 @@ broker-side signal and the shipped band the first order came 93 to 101 s after t
 1,708 s. The load was covered 374 s [341, 407] sooner. So the signal makes the rule act about six
 minutes sooner, twice; the step is the same, and after it the rule cannot decide for 20 minutes. Both
 jobs were over the limit for most of the 90 minutes. The second order of the broker-side jobs was cut by
-the maximum (the formula asked for 28 to 31 subtasks in the six of ten job-runs whose decision log
-covers that evaluation). `pendingRecords` showed 6 to 8% of the true backlog over the first ten minutes
+the maximum (Equation 1 asked for 21 to 22 subtasks in the six of ten job-runs whose decision log
+covers that evaluation; corrected on 23 Nov from 28 to 31, which was the policy's projected size, `ISSUES.md` #165). `pendingRecords` showed 6 to 8% of the true backlog over the first ten minutes
 in four runs and 15% in one (default signal, shipped band). Not planned, and the reason why the
 default-signal job needed no third step: while it ran with 2 subtasks its metric showed 6 to 7% of the
 backlog, and once it ran with 4 it showed 71 to 73% (52 to 81% by sample), in all five runs. Its second
@@ -1712,3 +1718,255 @@ lengthen a job's time over the limit; six runs cannot show an interference below
 
 Reproduce: `python3 bench/paper.py main` (and `e2c`, `e5`, `e4`, `e9`, `e2`), `python3 bench/main_marked.py`,
 `python3 bench/e2c_pairs.py`, `python3 bench/e4_blocks.py`, `python3 cluster/bench/decount.py <run dirs>`.
+
+## 18. On a job with 4 GiB of state the broker-side signal did not shorten the time over the limit (Tests F, G and H, 24 Nov, planned, after the paper's data cut-off)
+
+Section 13 is from a job without state worth the name: a restart cost 3.6 s without output. An outside
+review asked for one paired test in which a rescale is expensive. These are three attempts at that test.
+Each was planned and hashed before its first run (`paper/outline.md`, entries of 2026-11-24 00:22, 02:50
+and 04:14 PST), and each was designed after the one before: Test G because Test F's measure could not
+move, Test H because Test G broke on its own settings and showed that TaskManagers on one node hold up
+each other's disk (Test H gives every pod a node of its own; its plan was amended twice before its
+first run).
+
+Setup of Tests F and G: the built-in rule with the shipped band in two jobs side by side, `builtin+st4` (default
+signal) and `builtin+lagfix+st4` (backlog and arrival rate from the brokers), scale 2, the short time
+settings of section 13. Each job holds 4 GiB of keyed state in RocksDB (4,000 keys, 263 entries of 4 KiB
+per key, bytes that do not compress), incremental checkpoints every 10 s to the object store, local
+recovery off, so every restart downloads the state. TaskManagers have 2 CPUs and 6,144 MB, half of it
+left to the file cache. The measured phase begins when both jobs run at the scenario's size and a
+completed checkpoint of each holds the state. The measure is the seconds over the latency limit by the
+laptop's definition, from the harness's latency file, because the monitoring service's counter counts no
+second without output and a restore is a long stretch without output. The load is synthetic. The two
+jobs do not start from one checkpoint; they read the same records and wrote the same state.
+
+### Test F: eight minutes of overload, and a measure at its ceiling (8 runs)
+
+Scenario `surge` (400, then 4,800 records/s for 8 minutes, then 400; measured phase 660 s). Eight runs,
+24 Nov 08:27Z to 10:38Z, all clean by `disturbed_cluster.py`, all begun as planned with 3.91 to 3.93 GiB in
+each job's last checkpoint.
+
+Per run and job: seconds over the limit; sizes of Aggregate; sizes of Measure; seconds without output in
+stops of 3 s or more; records that left the job (of 2.46 million sent).
+
+| Run | Default signal | Broker-side signal |
+|---|---|---|
+| 1 | 557; 2, 6, 16; 1, 8; 352 s; 301k | 557; 2, 16; 1, 4, 9; 384 s; 596k |
+| 2 | 559; 2, 5, 16; 1, 6; 407 s; 180k | 559; 2, 16; 1, 3, 8; 352 s; 620k |
+| 3 | 576; 2, 5, 16; 1, 3, 16; 261 s; 632k | 576; 2, 4, 16; 1, 5, 10, 12; 268 s; 1027k |
+| 4 | 553; 2, 6, 16; 1, 2, 16; 295 s; 534k | 553; 2, 16; 1, 3, 8; 276 s; 1143k |
+| 5 | 582; 2, 6, 16; 1, 7; 371 s; 265k | 582; 2, 16; 1, 3, 8, 13; 316 s; 1145k |
+| 6 | 567; 2, 4, 12, 16; 1, 3; 313 s; 395k | 566; 2, 15, 16; 1, 2, 3, 8; 302 s; 1179k |
+| 7 | 544; 2, 5, 16; 1, 7; 329 s; 271k | 544; 2, 14, 16; 1, 2, 7, 13; 286 s; 1059k |
+| 8 | 575; 2, 5, 16; 1, 4; 418 s; 184k | 575; 2, 16; 1, 3, 7, 11; 303 s; 1171k |
+
+| Mean of 8 runs | Default | Broker-side | Paired difference [95% interval] | Lower in |
+|---|---|---|---|---|
+| Seconds over the limit (the planned measure) | 564.1 | 564.0 | -0.12 [-0.42, +0.17], exact p = 1.0 | 1 of 8 |
+| Monitoring service's counter | 213.6 | 244.6 | +31.0 [-3.9, +65.9] | 2 of 8 |
+| Slots held | 9.01 | 13.59 | +4.58 [+3.17, +5.98] | 0 of 8 |
+| Scale-ups of Aggregate | 2.12 | 1.38 | -0.75 [-1.14, -0.36] | 6 of 8 |
+| Rescales (Aggregate or Measure) | 2.38 | 2.75 | +0.38 [-0.25, +1.00] | 1 of 8 |
+| Seconds without output in stops | 343.2 | 310.9 | -32.4 [-70.2, +5.4] | 6 of 8 |
+| Seconds until the load is covered | 352 | 64 | -288 [-366, -211] | 8 of 8 |
+| Records emitted, thousands (not planned) | 345 | 992 | +647 [+438, +857] | 0 of 8 |
+
+What it says:
+
+- The planned measure could not move. Both jobs were over the limit from the second the load rose to
+  the end of the measured phase in every run. The planned test (F2) fails with p = 1.0, and so do F3
+  (fewer rescales) and F5 (a larger gain than without state). The clause against the repair is not met
+  either: the broker-side job was over the limit for longer in no run. The test does not answer the
+  question in either direction (`ISSUES.md` #172).
+- A rescale was expensive, as the test wanted (F1): 5,233 s without output in 117 stops over 41
+  rescales, 127.6 s per rescale, 35 times the 3.6 s of section 13. Each job emitted nothing for more
+  than half of the measured phase. The smoke run with one job had shown 27 s per rescale; two jobs
+  under the full overload took far longer.
+- The broker-side signal still sized the stateful operator in fewer steps (1.38 against 2.12 rescales
+  of Aggregate; the load was covered after 64 s against 352 s) and held 4.58 slots more (F4).
+- It did not save restarts. The rule resized the downstream operator Measure more often with the
+  broker-side signal (2.62 against 1.25 times, typically 1, 3, 8, then 11 to 13), and each resize of
+  Measure restarted the job and restored the whole state. This split by operator was not planned.
+- Not planned: the broker-side job got 992 thousand records out in the measured phase, the
+  default-signal job 345 thousand, of 2.46 million sent. Higher in 8 of 8 runs. Neither job was near
+  the limit when a run ended (the last output was 341 to 533 s late).
+
+Reproduce: `python3 cluster/bench/disturbed_cluster.py results-cluster/state surge`, `python3
+cluster/bench/statesum.py results-cluster/state surge` (the planned output is kept in
+`results-cluster/state/statesum-planned.txt`).
+
+Found afterwards, while Test G was looked into (`ISSUES.md` #175): the two jobs of Test F shared node
+disks. In each of the 8 runs one or two nodes held pods of both jobs, with most of the TaskManagers. A
+restore of 4 GiB reads and writes about 9 GB per TaskManager, and while one job restores, the other
+job's TaskManagers on that node wait for the disk (measured in Test G: 78% of a minute). So the 128 s
+per rescale include waiting for a disk the other job was using, which is why two jobs took so much
+longer than the one job of the smoke run, and the two jobs were not independent of each other. The
+job that asks for its TaskManagers first, the broker-side one, was also the one that the scheduler
+packed onto the shared node (in Test G's second run all four of its TaskManagers sat on one node and
+waited for its disk 58 to 83% of the time; the default job's sat on four nodes and waited next to
+never). So the test bed probably worked against the broker-side job in Test F. The ceiling stands. The
+restart cost and the unplanned contrasts carry this limit.
+
+### Test G: forty minutes of overload; stopped in its second run, no run counts, no outcome read
+
+Test F with one change: the scenario `surge_long` (400, then 4,800 records/s for 40 minutes; measured
+phase 2,880 s), so that a job could get back under the limit while the load was still high. Six runs
+were planned. Run 1 ended 24 Nov 11:48Z and `disturbed_cluster.py` marks it: each job lost a TaskManager
+inside the window. The queue was stopped during run 2. Nothing of the outcome was read; what was read
+of run 1 is listed in `paper/outline.md` (entry of 2026-11-24 04:14 PST).
+
+The cause is in the test's settings (`ISSUES.md` #174):
+
+- After a rescale the first checkpoint stays pending for about three minutes while the subtasks restore
+  4 GiB. Flink queues the periodic checkpoints that fall due meanwhile (one per 10 s; no minimum pause
+  was set) and then runs them back to back, one every 2 s.
+- Each makes RocksDB write a file into its first level. After 17 in a row, in both jobs, RocksDB held
+  20 such files, its threshold for slowing writes, and the next checkpoint's flush waited for a
+  compaction. The compaction read the restored state from a busy node disk at about 4.6 MB/s and did
+  not finish in 13 minutes.
+- The checkpoint expired after 10 minutes. No failed checkpoint was tolerated, so the job failed. The
+  blocked tasks ignored the cancel for 180 s, and the TaskManager shut itself down. The job restored
+  its state once more. Broker-side job: 32 minutes after the rise. Default job: 35 minutes after it.
+
+Both jobs failed the same way, so this says nothing about either signal. It says that the test, as I set
+it up, was not a fair one at 4 GiB: a checkpoint every 10 s without a minimum pause, and two jobs on
+shared disks.
+
+Reproduce the check: `python3 cluster/bench/disturbed_cluster.py results-cluster/state-long surge_long`,
+`python3 cluster/bench/ownfail.py results-cluster/state-long surge_long`.
+
+### Test H: forty minutes of overload with every pod on a node of its own (7 runs, 6 counted): the planned test fails
+
+Test G with one change: `--alone`. Every Flink pod of the test, the JobManagers and TaskManagers of both
+jobs, refuses a node that already holds another Flink pod of the test (required pod anti-affinity on
+the host name). A pod that finds no free node waits for a new one. So no TaskManager shares a node
+disk with another, of its own job or of the other. The state stays at 4 GiB: a smoke run with one job
+alone had lost 27 s per rescale and had no checkpoint gap above 68 s, so the size was not the fault of
+Test G. The plan and its two amendments were hashed before the first run (`paper/outline.md`, entries of
+2026-11-24 04:14, 04:18 and 04:55 PST; a first version with 1 GiB and jobs kept apart from each other
+only was started and stopped four minutes into its warm-up, and nothing of it was read).
+
+Predictions, written before the first run:
+
+- H0 (the test does what it is for): at least 20 s without output per rescale, pooled.
+- H1 (the measure has room): the broker-side job is over the limit for less than 2,400 of 2,880 s in at
+  least 5 of 6 runs.
+- H2 (the one test): the broker-side job is over the limit for fewer seconds than the default job in 6
+  of 6 runs (exact sign-flip test, two-sided, 0.05; six of six gives p = 0.031).
+- H3: the mean paired difference is below -283 s, the difference of the stateless test (section 13) by
+  the same measure.
+- H4: the broker-side job holds more slots.
+- Against the repair: the broker-side job is over the limit for longer in 4 or more of 6 runs.
+- No prediction on the number of rescales (Test F had it wrong).
+
+Which runs count: `disturbed_cluster.py` first; then `ownfail.py`; a run in which a node held two Flink
+pods of the test at one time does not count; the start as planned. At most 7 attempts, no start after
+11:00 PST. One look per copied run was planned: its checks and the broker-side job's seconds over the
+limit, nothing of the default job. The test was to stop if that number reached 2,400 s in two runs.
+
+What happened to the runs:
+
+- Seven runs, 24 Nov 13:06Z to 19:46Z. Six count: 1, 2, 3, 5, 6 and 7. All six are clean by both
+  checks, began as planned with 4.07 GiB in each job's last checkpoint, and had no node with two Flink
+  pods of the test.
+- Run 4 is marked and set aside. A TaskManager of the broker-side job shut itself down 1,793 s into
+  the measured phase: the job went to RESTARTING at 1,614 s and its tasks did not stop within Flink's
+  180 s. No cluster event names the pod and the record holds no expired checkpoint, so `ownfail.py`
+  does not call it the job's own failure. The treatment was written down before run 4's number was
+  read: it does not count, a seventh run is made, and the result is also given with it.
+- The stop rule needed a reading. After run 6 the broker-side job had been at 2,400 s or more in two
+  runs, run 4 (2,685 s, not counted) and run 6 (2,629 s). The rule's words do not say whether a marked
+  run counts. Its reason does (H1 is about the counted runs), so the test went on; this was written
+  down before run 7 ended and before any number of the default job was read. By the letter, with run 4,
+  the test would have ended after run 6 without a comparison. Run 7 had been started by a script
+  before run 6's number was read.
+- Placement: the job that asks for TaskManagers first takes the free nodes. Only run 1 had waits for
+  new nodes (broker-side job 2, 4, 14, 101 s; default job 3, 125, 120, 120 s), which works for the
+  broker-side job there. All other runs: 2 to 3 s per TaskManager for both jobs.
+
+Per run and job: seconds over the limit of 2,880 (the planned measure); slots held; rescales; seconds
+without output in stops of 3 s or more; seconds until the load is covered.
+
+| Run | Default signal | Broker-side signal | Difference in seconds over the limit |
+|---|---|---|---|
+| 1 | 952; 13.97; 8; 79 s; 280 s | 1,515; 14.82; 9; 294 s; 75 s | +563 |
+| 2 | 736; 14.44; 6; 80 s; 165 s | 591; 14.76; 5; 79 s; 40 s | -145 |
+| 3 | 758; 14.58; 6; 64 s; 187 s | 1,089; 14.75; 7; 199 s; 42 s | +331 |
+| 4 (not counted) | 2,720; 14.72; 14; 711 s; 184 s | 2,685; 15.12; 11; 776 s; 49 s | -35 |
+| 5 | 772; 14.64; 7; 61 s; 200 s | 1,291; 15.03; 7; 259 s; 55 s | +519 |
+| 6 | 727; 14.48; 6; 55 s; 183 s | 2,629; 15.14; 10; 774 s; 48 s | +1,902 |
+| 7 | 2,716; 14.66; 12; 937 s; 200 s | 517; 15.11; 4; 72 s; 50 s | -2,199 |
+
+| Mean of the 6 counted runs | Default | Broker-side | Paired difference [95% interval] | Lower in |
+|---|---|---|---|---|
+| Seconds over the limit (the planned measure) | 1,110.2 | 1,272.0 | +161.8 [-1,247.2, +1,570.8], exact p = 0.66 | 2 of 6 |
+| Monitoring service's counter | 882.2 | 979.5 | +97.3 [-754.9, +949.6] | 2 of 6 |
+| Slots held | 14.46 | 14.94 | +0.47 [+0.22, +0.73] | 0 of 6 |
+| Scale-ups of Aggregate | 2.17 | 1.83 | -0.33 [-0.88, +0.21] | 2 of 6 |
+| Rescales (Aggregate or Measure) | 7.50 | 7.00 | -0.50 [-4.74, +3.74] | 2 of 6 |
+| Seconds without output in stops | 212.7 | 279.5 | +66.8 [-476.9, +610.5] | 2 of 6 |
+| Seconds until the load is covered | 202 | 51 | -150.9 [-180.2, -121.5] | 6 of 6 |
+| Records emitted, thousands (of 11,906 sent) | 11,550 | 11,763 | +212.5 [-248.5, +673.6] | 2 of 6 |
+
+The predictions:
+
+- H0 holds by its definition: 2,953 s without output in 123 stops over 87 rescales, 33.9 s per rescale.
+  Most of that is the stalls described below. Without the stops of 60 s or more it is 13.3 s per
+  rescale (1,155 s over 87), less than the 20 s the test wanted, so a plain rescale was cheaper here
+  than planned for.
+- H1 holds: under 2,400 s in 5 of 6 counted runs.
+- H2, the one test, fails: fewer seconds over the limit in 2 of 6 runs, exact p = 0.66.
+- H3 fails: +162 s, not below -283 s.
+- H4 holds: 0.47 slots more, in 6 of 6 runs.
+- The clause against the repair is met: the broker-side job was over the limit for longer in 4 of 6
+  runs (1, 3, 5 and 6).
+
+With run 4 (seven runs, no test): fewer seconds in 3 of 7, +133.7 s [-1,001.9, +1,269.3]; the load
+covered 148.6 s sooner in 7 of 7; 0.46 slots more in 7 of 7.
+
+What it says:
+
+- With 4 GiB of state the broker-side signal still made the rule act sooner. The job ran at the size
+  the load needs 151 s sooner in every run, for half a slot more.
+- The test did not show a shorter time over the limit. The broker-side job was over the limit for
+  longer in 4 of 6 runs. The interval is about 1,400 s wide either way and contains the gain of the
+  stateless test by this measure (-283 s), so the test neither shows that gain nor rules it out.
+- By the clause written before the test (longer in 4 or more of 6 runs) the count goes against the
+  repair for a job like this one. The plan's words for that case were "the repair costs more than it
+  gains"; the data do not carry that much, and the paper says what they carry: the test did not show
+  the gain, with the count, the interval and the stalls.
+- Two things limit what the comparison with the stateless tests means. Test H ran the 40-minute
+  overload with one-minute windows, and no stateless campaign has that pair of settings (section 13
+  has one-minute windows with 8 minutes and five-minute windows with 40). And the seconds over the
+  limit are by the laptop's definition, which counts a second without output; the monitoring
+  service's counter, the measure of section 13, gives 980 against 882 s.
+
+Not planned, looked at after the outcome (it explains, it does not test):
+
+- The difference is not in the rescales (7.0 against 7.5 per run). It is in stops of one to four
+  minutes. Stops of 60 s or more, start and length in seconds of the measured phase: run 1 broker-side
+  job (578, 163); run 3 broker-side (588, 135); run 5 broker-side (436, 121) and (577, 70); run 6
+  broker-side (483, 214), (1045, 214), (1585, 210); run 7 default job (645, 77), (1023, 63), (1413,
+  179), (1898, 177), (2383, 175); run 2 none; run 4 both jobs. One job stalled in five of the six
+  counted runs: the broker-side job in four, the default job in one. The two runs without a stall of
+  the broker-side job are the two it won.
+- Each stall begins while the job is RUNNING at an unchanged size, the first one 5 to 8 minutes after
+  the rise of the load. In run 6 the operator's log shows no action before the first and the third
+  stall; the second began 13 s before a rescale was triggered. After a stall the job restarts (RESTARTING
+  for about 170 to 180 s in runs 4 and 6, for 115 s in run 7) or is rescaled, and the rule, which saw no
+  throughput, then sizes the downstream operator wrongly (run 6: Measure from 5 to 3, then to 11).
+- The TaskManagers of the job that stalled waited for their disk more: run 6, 17.7% of the time
+  against 2.5%; run 7, 8.3% against 15.5%; runs 1, 3 and 5, 12.2, 9.5 and 12.1% against 4.0, 2.9 and
+  3.1%. That fits a state backend that stops taking writes. The cause is not established
+  (`ISSUES.md` #178).
+- Whether the broker-side signal brings the stall on, by putting the job at full size and through its
+  backlog sooner, or whether four runs to one is chance, six runs cannot tell.
+- Without run 1, the only run with node waits: -145, +331, +519, +1,902, -2,199 (mean +82 s, fewer in
+  2 of 5).
+
+Reproduce: `python3 cluster/bench/disturbed_cluster.py results-cluster/state-alone surge_long`, `python3
+cluster/bench/ownfail.py results-cluster/state-alone surge_long`, `python3 cluster/bench/nodewait.py
+results-cluster/state-alone surge_long`, `python3 cluster/bench/statesum.py results-cluster/state-alone
+surge_long --without 4` and the same without the option (the planned output of both is kept in
+`results-cluster/state-alone/statesum-planned.txt`; the monitoring service's numbers are in
+`results-cluster/state-alone/datadog.json`).
