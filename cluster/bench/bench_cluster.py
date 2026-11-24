@@ -45,6 +45,8 @@ sys.path[:0] = [_HERE, os.path.join(os.path.dirname(os.path.dirname(_HERE)), "be
 import bench  # noqa: E402  the laptop harness
 import scenarios  # noqa: E402
 from bench import safe  # noqa: E402
+from pacing import Pacer, parse_burst  # noqa: E402
+from startcheck import jobs_ready, keep_warming, start_state  # noqa: E402
 
 # bench.py resolves names to IPv4 only, for a quirk of the laptop. Not wanted in a cluster.
 socket.getaddrinfo = bench._getaddrinfo
@@ -342,9 +344,9 @@ class LoadGenerator(threading.Thread):
         partitions, keys, hot_keys = bench.PARTITIONS, scenarios.NUM_KEYS * SCALE, scenarios.HOT_KEYS
         measure_cost = scenarios.MEASURE_COST
         rng = random.Random(f"{self.s.name}-keys")
-        carry = 0.0
-        last = time.time()
-        next_log = last
+        self.pacer = Pacer(*(bench.BURST or (0.0, 1.0)))
+        self.pacer.due(0.0, time.time())
+        next_log = time.time()
         with open(self.out_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["t", "target_rate", "agg_cost_us", "hot_fraction", "sent_total"])
@@ -355,10 +357,7 @@ class LoadGenerator(threading.Thread):
                     break
                 t = 0.0 if t0 is None or NO_EVENT else max(0.0, now - t0 - self.shift)
                 rate, cost, hot = self.s.rate(t), self.s.agg_cost(t), self.s.hot(t)
-                carry += rate * (now - last)
-                last = now
-                n = int(carry)
-                carry -= n
+                n = self.pacer.due(rate, now)
                 ms = int(now * 1000)
                 for _ in range(n):
                     if hot > 0 and rng.random() < hot:
@@ -462,6 +461,8 @@ def arm_conf(planned):
       window:N    the policy in code sizes a scale-down for the highest demand of the last N seconds
       capped      with window:N, the trend projection does not go above that highest demand while
                   the demand is below it (scale-down.window-caps-trend)
+      keepmargin  with window:N, a scale-down keeps what that highest demand plus the cap's margin needs
+                  (scale-down.window-keeps-margin, ISSUES.md #119)
       minslots:N  a plan that only scales down is dropped unless it frees N slots (scale-down.min-slots)
       stepaware   with the broker-side signal (+lagfix): a jump in the arrival rate that the job does not
                   keep up with is sized at the newest interval's rate (lag.step-aware)
@@ -482,6 +483,8 @@ def arm_conf(planned):
                 conf[JEV + "scale-down.window-seconds"] = f[7:]
             elif f == "capped":
                 conf[JEV + "scale-down.window-caps-trend"] = "true"
+            elif f == "keepmargin":
+                conf[JEV + "scale-down.window-keeps-margin"] = "true"
             elif f == "stepaware":
                 conf[JEV + "lag.step-aware"] = "true"
             elif f.startswith("minslots:") and f[9:].isdigit():
@@ -557,6 +560,13 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
         for th in (load, sampler, latency):
             th.start()
         limit = s.rate(0) * 20 + 1000
+        initial = {j: bench.initial_parallelism(s, bench.autoscaler_conf(j, jev_overrides)) for j in jobs}
+        wanted = {j: bench.start_sizes(j, s, jev_overrides) for j in jobs}  # differs from `initial` for +aggN and +off
+
+        def ready():
+            at_size = start_state(sampler.sizes(), wanted)["at_scenario_size"]
+            return jobs_ready(sampler.drained(limit), sampler.settled(bench.SETTLE_S), at_size, bench.START_WAIT)
+
         if planned:
             # The start is fixed, because the jobs were told when the load changes.
             if planned["t0_epoch"] - base < s.warmup:
@@ -564,13 +574,16 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
                                    f"less than the warm-up of {s.warmup} s")
             while load.is_alive() and time.time() < planned["t0_epoch"] - 5:
                 time.sleep(1)
-        while not planned and load.is_alive() and (time.time() - base < s.warmup or (
-                not (sampler.drained(limit) and sampler.settled(bench.SETTLE_S))
-                and time.time() - base < s.warmup + bench.DRAIN_MAX)):
+        while not planned and load.is_alive() and keep_warming(time.time() - base, s.warmup, bench.DRAIN_MAX, ready()):
             time.sleep(5)
         drained, settled, lag_at_t0 = sampler.drained(limit), sampler.settled(bench.SETTLE_S), sampler.lags()
+        # Whether the jobs begin the measured phase at the scenario's size (ISSUES.md #146). A planned run
+        # starts at its fixed moment and only records it.
+        start_at_t0 = start_state(sampler.sizes(), wanted)
+        start_at_t0["waited_for"] = bool(bench.START_WAIT and not planned)
         clock.t0 = t0 = planned["t0_epoch"] if planned else time.time() + 5
-        print(f"    warm-up {t0 - base:.0f}s, drained={drained}, settled={settled}, shift={shift}s, lag={lag_at_t0}", flush=True)
+        print(f"    warm-up {t0 - base:.0f}s, drained={drained}, settled={settled}, shift={shift}s, lag={lag_at_t0}, "
+              f"at scenario size={start_at_t0['at_scenario_size']}, equal={start_at_t0['equal']}, sizes={start_at_t0['sizes']}", flush=True)
         while load.is_alive():
             load.join(timeout=30)
             print(f"    t={time.time() - t0:7.1f}s sent={load.sent}", flush=True)
@@ -636,7 +649,7 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
             "duration": s.duration, "warmup": round(t0 - base), "warmup_planned": s.warmup,
             "drained": drained, "settled": settled, "lag_at_t0": lag_at_t0,
             "events": [e + shift for e in s.events], "shift": shift,
-            "initial_parallelism": {j: bench.initial_parallelism(s, bench.autoscaler_conf(j, jev_overrides)) for j in jobs},
+            "initial_parallelism": initial, "start": start_at_t0, "burst": list(bench.BURST) if bench.BURST else None,
             "metric_refresh": bench.METRIC_REFRESH_S, "partitions": bench.PARTITIONS, "key_groups": bench.KEY_GROUPS,
             "source_parallelism": bench.SOURCE_PARALLELISM, "record_bytes": 0, "fault": None,
             "records_sent": load.sent, "started_utc": started_utc, "fetch_bytes": bench.FETCH_BYTES,
@@ -687,7 +700,7 @@ def main():
                         help="multiply rates, partitions, keys, key groups and the largest parallelism by this")
         sp.add_argument("--jitter", type=int, default=0)
         sp.add_argument("--arm", action="append", default=[], metavar="JOB=FEATURE[,FEATURE]",
-                        help="extras of one job: note[:KIND], schedule, history, window:SECONDS, capped, minslots:N (see arm_conf)")
+                        help="extras of one job: note[:KIND], schedule, history, window:SECONDS, capped, keepmargin, minslots:N (see arm_conf)")
         sp.add_argument("--planned", action="store_true",
                         help="the first load change falls on a whole minute that is fixed before the jobs "
                              "start; needed for note and schedule")
@@ -698,6 +711,12 @@ def main():
                         help="fixed source parallelism at scale 1 (multiplied by the scale); 0 = autoscaled")
         sp.add_argument("--fetch-bytes", type=int, default=None)
         sp.add_argument("--llm-model", default=bench.LLM_AUTOSCALER["job.autoscaler.jev.llm.model"])
+        sp.add_argument("--burst", default=None, metavar="PERIOD_S:DUTY",
+                        help="send every period's records in the first DUTY share of the period, at the same "
+                             "average rate, e.g. 1:0.2 (as bench.py)")
+        sp.add_argument("--start-wait", action="store_true",
+                        help="the warm-up also waits until every job runs at the scenario's size, inside its usual "
+                             "bound; without it the state is only recorded in meta.json as 'start' (as bench.py)")
         sp.add_argument("--windows", choices=["short", "long", "default"], default="short",
                         help="long: 5-minute metric window, 2-minute stabilization, 10-minute scale-down interval, "
                              "5-minute catch-up, and the plugin's cooldown and look-ahead scaled alike (as bench.py); "
@@ -715,6 +734,12 @@ def main():
     if bad or len(set(bench.JOBS)) != len(bench.JOBS):
         raise SystemExit(f"unknown or repeated job in --jobs {args.jobs}")
     bench.JITTER, bench.FETCH_BYTES = args.jitter, args.fetch_bytes
+    bench.START_WAIT = args.start_wait
+    if args.burst:
+        try:
+            bench.BURST = parse_burst(args.burst)
+        except ValueError as e:
+            raise SystemExit(str(e))
     PLANNED = args.planned
     NO_EVENT = getattr(args, "no_event", False)
     if NO_EVENT and not PLANNED:

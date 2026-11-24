@@ -1392,11 +1392,53 @@ an earlier level is sized with one reading of a capacity that moves by 5%, and n
 size it picks from the size at which the policy scales up again.
 
 Limits: five runs, one load shape, one cluster, no significance test. The remedy for the second cause
-(a margin on the size a scale-down keeps for an earlier level) is not built.
+(a margin on the size a scale-down keeps for an earlier level) was built and tested afterwards (below).
 
 Reproduce: `python3 cluster/bench/flapsum.py results-cluster/policyfix2/onoff/rep*`,
 `python3 cluster/bench/flaporders.py results-cluster/policyfix2/onoff/rep*`, monitoring extracts in
 `results-cluster/policyfix2/datadog.json`.
+
+### The margin on the size a scale-down keeps (Test D, 5 runs on 23 Nov, planned, after the paper's data cut-off)
+
+Plan entry of 23 Nov 00:31 PST, checks and outcome entries of 14:45 and 14:48 PST. The same on-off load,
+five jobs side by side, operator image `cluster11`: the policy without a look-back (`rule`), with the
+look-back, the cap and the two-slot rule as above (`rule+c`), the same plus the margin (`rule+d`:
+a scale-down keeps what the window's highest demand plus 10% needs), the LLM with the look-back, and the
+built-in rule. All five runs are clean.
+
+From the second high phase on:
+
+| Job | restarts per run | scale-downs undone | s over the limit |
+|---|---|---|---|
+| policy, no look-back | 7, 8, 7, 7, 7 | 2.8 per run | 29, 124, 22, 31, 45 |
+| look-back, cap, two slots | 1, 2, 1, 1, 2 | one, ordered 8 s before the end of run 2 | 2, 3, 2, 1, 24 |
+| the same plus the margin | 1, 2, 2, 1, 2 | none | 3, 21, 4, 3, 13 |
+| LLM with the look-back | 4, 5, 3, 4, 2 | 1.6 per run | 39, 14, 17, 11, 14 |
+| built-in rule, two-minute scale-down delay | 0, 4, 2, 0, 4 | 0.6 per run | 0, 13, 9, 0, 2 |
+
+Four of five predictions held: at most two restarts of the job with the margin in every run; the replay of
+the policy with the margin gives its logged choice in 295 of 295 evaluations; it ordered no scale-up at a
+demand within the margin of the earlier level; it was over the limit for 2.4 s more than the job without
+the margin (10 s was the bound). The fifth failed on its size: the margin cost 0.05 slots [-0.28, 0.37]
+where 0.3 to 1.5 was predicted. The clause against the change is not met.
+
+The case the margin is for occurred once. In run 2 the job without it went from 12 to 10 subtasks at
+1,039 s, because the earlier level needed 9.93 subtasks at that evaluation's capacity reading, and
+ordered 10 to 15 at 1,432 s, 88 s into a high phase, at a demand within the margin of that level. The job
+with the margin stayed at 12 in the same run: at five evaluations the form without the margin would have
+scaled down, and with it the level needed 11.1.
+
+With Test B: the job without the margin undid a scale-down in three of ten runs, the job with it in none
+of five. That is not a test, and one event in five control runs is thin. What the two tests show together
+is that the look-back with the cap, the two-slot rule and the margin takes the policy from 7 to 8
+restarts per run on a load that comes back every two minutes to 1 or 2, with no scale-down undone and
+without more time over the limit than the built-in rule (132 s against 144 s over the whole run, 11.4
+against 11.3 slots).
+
+Reproduce: `python3 cluster/bench/flapsum.py results-cluster/keepfix/onoff/rep*`,
+`python3 cluster/bench/flaporders.py results-cluster/keepfix/onoff/rep*`,
+`python3 cluster/bench/keepreplay.py --job d results-cluster/keepfix/onoff/rep*` (and without `--job d` for
+the job without the margin), monitoring extracts in `results-cluster/keepfix/datadog.json`.
 
 
 ## 16. With five-minute windows a demand that follows a jump in the load cut the built-in rule's time over the limit from 20 minutes to two and a half (cluster test C, scale 2, 6 runs)
@@ -1506,7 +1548,53 @@ generator: a listing of the latest offsets returns the high watermark, which on 
 waits for the followers and so advances unevenly at the scale of half a second. That matches what Tests
 C and A showed (most readings right, some far off, two jobs off in the same cycle). A span of two
 seconds, which the changed plugin uses at the first step, brings the reading within about 20% of the
-load. It does not make it exact, and the remedy is still not run in closed loop (Test E).
+load. It does not make it exact. The run in closed loop is the next subsection.
+
+### The remedy in closed loop (cluster Test E, five runs, registered on 23 Nov 08:20 PST; not for the paper)
+
+Operator image `cluster12`: later step lines take the newest interval's rate alone; at the first step line
+of a rise, when the half-second reading is above the newest interval's rate, the end offsets are read a
+third time two seconds after the first reading, and that rate is the demand if it is above the newest
+interval's rate. Scenario `surge` at scale 2 with one-minute windows, as Test A, four jobs side by side
+that all have the broker-side signal and the option (shipped band and band at the target, two of each).
+Five runs on 23 Nov between 14:46 and 16:36 PST, all clean. Run 5 was made twice: the cluster evicted the
+driver pod during the first attempt and nothing of it exists (`ISSUES.md` #151). The test began after the
+paper's data cut-off and is not in the paper. Scripts: `cluster/bench/stepnow.py` (step lines) and
+`cluster/bench/escore.py` (orders and times); every count below takes the load at the line's own moment.
+
+| Prediction | Outcome |
+|---|---|
+| E1. Demand 0.8 to 1.25 of the load at every first step line with a third reading | Not met: 14 of 18 (0.95 to 1.15); the four jobs of run 5 got 0.68 to 0.76 |
+| E2. The half-second reading is outside 0.8 to 1.25 at 15% or more of the first step lines | Not met: 2 of 21 (1.55 and 1.39 times the load); Test A had 5 of 20 |
+| E3. The first order asks for 10 subtasks or more in every job-run | Met: 14 to 16 in 20 of 20, 2 to 18 s after the rise |
+| E4. At every later step line the demand is the newest interval's rate, 0.9 to 1.1 of the load | Met: 34 of 34, 0.97 to 1.02 |
+| E5. Ten subtasks run within 75 s in every job-run | Not met by one second: 19 of 20 (38 to 76 s) |
+| Against the remedy: a demand above 1.4 times the load after a third reading; a first order below 10 in more than one job-run; more than 100 s to ten subtasks | None of the three |
+
+What the lines show.
+- The over-reading is gone. No step line of this build put the demand above 1.15 times the load. The one
+  half-second reading of the tested rise that was far off (7,436 records/s against 4,800, run 3) was
+  replaced by a two-second reading of 5,502. At the 34 later lines the half-second reading, which this
+  build no longer uses there, was 0.45 to 1.22 of the load and outside 0.8 to 1.2 at six.
+- A new error in the other direction. In run 5 all four jobs took their third reading about 10 s after
+  the rise and got 3,277 to 3,650 records/s over two seconds, 0.68 to 0.76 of the load, while their
+  half-second readings were right (0.99 to 1.07) and the generator's log shows the full rate. The newest
+  interval still held part of the time before the rise (0.57 to 0.60 of the load), so the low two-second
+  reading was above it and became the demand. The probe had seen 0.79 to 1.23 over two seconds; this is
+  outside that range, on four topics at once.
+- It cost little here. The first orders of run 5 were 2 to 15, 15, 15 and 14 subtasks instead of 16, and
+  ten are needed. Ten subtasks ran 56 to 76 s after the rise in run 5 and 38 to 64 s in the other runs,
+  but run 5 also began 16 minutes after the node replacement, so the longer times cannot be put on the
+  reading.
+- Seconds over the limit (monitoring service): 155 s on average over the 20 job-runs (111 to 213 s; by
+  run 171, 117, 166, 144, 181); slots held 13.7. The plan has no contrast for these.
+
+Reading. Two of five predictions met, none of the clauses against the change. The change removes what it
+was made to remove, and the runs exercised that case once, so they say little about how well. They also
+show that a longer span is not a safe reading either: the brokers' end offsets can stall for a good part
+of two seconds. A reading that cannot be far off in either direction would need a signal that does not
+depend on the high watermark, or a rule that waits one more evaluation when the two readings disagree.
+Neither is built. `ISSUES.md` #141 stays open.
 
 ## 17. The last laptop night: the main campaign with its replacement run, identical jobs in three more scenarios, held-out workloads, slower restarts, failing model calls, single jobs (23 Nov)
 

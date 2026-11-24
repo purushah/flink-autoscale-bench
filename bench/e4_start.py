@@ -37,6 +37,19 @@ def ci(x):
     return f"{100 * x.mean():+.1f}% [{100 * (x.mean() - half):+.1f}, {100 * (x.mean() + half):+.1f}], PaC longer in {(x > 0).sum()} of {len(x)}"
 
 
+def at_scenario_size(meta, samples):
+    """True when every job begins the measured phase at the scenario's size. Runs made after the
+    harness got its start check carry the answer in meta.json (`start`, Aggregate and Measure); older
+    runs are read from their samples (Aggregate only)."""
+    if "start" in meta:
+        return bool(meta["start"]["at_scenario_size"])
+    at_size = True
+    for job in meta["jobs"]:
+        s = samples[(samples.job == job) & samples.p_aggregate.notna()]
+        at_size &= int(s[s.t >= 0].p_aggregate.iloc[0]) == meta["initial_parallelism"][job][0]
+    return bool(at_size)
+
+
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "results-e4"
     rows, warm_ups, job_runs, equal = [], 0, 0, 0
@@ -45,14 +58,14 @@ def main():
         sc, rep, ev, dur = d.split("/")[-2], int(d.rsplit("rep", 1)[1]), m["events"][0], m["duration"]
         latency = pd.read_csv(os.path.join(d, "latency.csv"))
         samples = pd.read_csv(os.path.join(d, "samples.csv"))
-        at_size = True
         for job in m["jobs"]:
             s = samples[(samples.job == job) & samples.p_aggregate.notna()]
             warm = s[s.t < 0].p_aggregate.to_numpy()
             warm_ups += bool((np.diff(warm) > 0).any())
             job_runs += 1
-            at_size &= int(s[s.t >= 0].p_aggregate.iloc[0]) == m["initial_parallelism"][job][0]
-        equal += at_size
+        equal += at_scenario_size(m, samples)
+        if "start" in m:
+            print(f"{sc} rep {rep}: start state recorded by the harness: {m['start']}")
         row = dict(scenario=sc, rep=rep)
         for job, tag in ((P, "pac"), (B, "bi")):
             healthy = analyze.healthy_series(analyze.per_second(latency, job, dur).p95).loc[0:dur]

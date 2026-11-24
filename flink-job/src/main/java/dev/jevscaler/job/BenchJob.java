@@ -11,6 +11,9 @@ import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
@@ -111,6 +114,8 @@ public final class BenchJob {
         int aggPar = params.getInt("agg-parallelism", 0);
         int measurePar = params.getInt("measure-parallelism", 0);
         long restoreDelayMs = params.getLong("restore-delay-ms", 0);
+        // false: the delay applies only when the job restores from a checkpoint, not on its first start.
+        boolean restoreDelayFirstStart = params.getBoolean("restore-delay-first-start", true);
 
         var raw = env.fromSource(source, WatermarkStrategy.noWatermarks(), "Source").uid("source");
         if (sourcePar > 0) {
@@ -121,7 +126,7 @@ public final class BenchJob {
             parsed.setParallelism(sourcePar);
         }
         var aggregated =
-                parsed.keyBy(e -> e.key).process(new Aggregate(restoreDelayMs)).name("Aggregate").uid("aggregate");
+                parsed.keyBy(e -> e.key).process(new Aggregate(restoreDelayMs, restoreDelayFirstStart)).name("Aggregate").uid("aggregate");
         if (aggPar > 0) {
             aggregated.setParallelism(aggPar);
         }
@@ -137,24 +142,46 @@ public final class BenchJob {
         env.execute("bench-" + inTopic);
     }
 
+    /**
+     * How long Aggregate waits before it processes its first record after a (re)start. The delay stands
+     * in for loading a large state, so it always applies to a restore. Whether the first start waits too
+     * is a choice: a first start that waits builds a backlog before the run begins.
+     */
+    static long delayFor(boolean restored, boolean firstStartToo, long delayMs) {
+        return (restored || firstStartToo) && delayMs > 0 ? delayMs : 0;
+    }
+
     /** Keeps a running count and sum per key and spends the record's simulated cost. */
-    static final class Aggregate extends KeyedProcessFunction<String, Event, Event> {
+    static final class Aggregate extends KeyedProcessFunction<String, Event, Event> implements CheckpointedFunction {
         private final long restoreDelayMs;
+        private final boolean restoreDelayFirstStart;
+        private transient boolean restored;
         private transient ValueState<long[]> totals;
         private transient Pacer pacer;
 
-        Aggregate(long restoreDelayMs) {
+        Aggregate(long restoreDelayMs, boolean restoreDelayFirstStart) {
             this.restoreDelayMs = restoreDelayMs;
+            this.restoreDelayFirstStart = restoreDelayFirstStart;
         }
+
+        @Override
+        public void initializeState(FunctionInitializationContext context) {
+            restored = context.isRestored();
+        }
+
+        @Override
+        public void snapshotState(FunctionSnapshotContext context) {}
 
         @Override
         public void open(Configuration parameters) throws Exception {
             totals = getRuntimeContext().getState(new ValueStateDescriptor<>("totals", long[].class));
             pacer = new Pacer();
-            if (restoreDelayMs > 0) {
+            long delay = delayFor(restored, restoreDelayFirstStart, restoreDelayMs);
+            if (delay > 0) {
                 // Stands in for restoring a large state: the subtask processes nothing for this long
-                // every time the job (re)starts, as it would while downloading and loading its state.
-                Thread.sleep(restoreDelayMs);
+                // when the job restores (and, unless told otherwise, on its first start), as it would
+                // while downloading and loading its state.
+                Thread.sleep(delay);
             }
         }
 

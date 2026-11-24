@@ -49,6 +49,11 @@ def _scale_down(t):
     return 1800 if t < 60 else 300
 
 
+def _rising_dips(t):
+    base = 300 + 1500 * min(max(t, 0), 900) / 900
+    return base / 2 if any(a <= t < a + 90 for a in (180, 450, 720)) else base
+
+
 def _cycle(t):
     return 1100 - 800 * math.cos(2 * math.pi * max(t, 0) / 900)
 
@@ -231,6 +236,35 @@ SCENARIOS = {
             warmup=120,
             rate=lambda t: 1200 if t >= 20 else 400,
             events=(20,),
+        ),
+        # Three more load shapes, one per reported complaint about the autoscaler (added on 23 Nov 2026).
+        # No input for five minutes: does a rule scale down on it and jump back when input returns?
+        Scenario(
+            name="idle",
+            title="Idle: 300 rec/s, nothing for 5 min, 300 rec/s again",
+            duration=1200,
+            warmup=180,
+            rate=lambda t: 0 if 300 <= t < 600 else 300,
+            events=(300, 600),
+        ),
+        # A load that rises for 15 minutes with three dips of 90 s to half of the rate it has then:
+        # every scale-in during a dip is undone a little later.
+        Scenario(
+            name="rising_dips",
+            title="Rising with dips: 300 to 1800 rec/s in 15 min, three 90 s dips to half",
+            duration=1080,
+            warmup=180,
+            rate=_rising_dips,
+            events=(180, 270, 450, 540, 720, 810),
+        ),
+        # A peak that returns every eight minutes: what a schedule or a forecast could know.
+        Scenario(
+            name="recurring",
+            title="Recurring peak: 300 rec/s with 2 min of 1800 rec/s every 8 min, four times",
+            duration=1920,
+            warmup=180,
+            rate=lambda t: 1800 if t >= 0 and 240 <= t % 480 < 360 else 300,
+            events=(240, 360, 720, 840, 1200, 1320, 1680, 1800),
         ),
     ]
 }

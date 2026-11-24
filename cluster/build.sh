@@ -30,7 +30,8 @@ if [ "$what" = flink ]; then
 elif [ "$what" = driver ]; then
   mkdir -p "$STAGE/bench"
   cp "$ROOT/cluster/bench/"*.py "$STAGE/bench/"
-  cp "$ROOT/bench/scenarios.py" "$ROOT/bench/bench.py" "$STAGE/bench/"
+  # Everything bench.py and bench_cluster.py import from bench/ (bench/tests/test_wiring.py checks this list).
+  cp "$ROOT/bench/scenarios.py" "$ROOT/bench/bench.py" "$ROOT/bench/pacing.py" "$ROOT/bench/startcheck.py" "$STAGE/bench/"
   build flink-autoscale-bench-driver "$ROOT/cluster/deploy/Dockerfile.driver"
 else
   echo "unknown target $what" >&2; exit 1

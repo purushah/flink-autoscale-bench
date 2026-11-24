@@ -40,6 +40,8 @@ from kafka.admin import NewTopic
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scenarios  # noqa: E402
+from pacing import Pacer, parse_burst  # noqa: E402
+from startcheck import jobs_ready, keep_warming, start_state  # noqa: E402
 from scenarios import HOT_KEYS, MEASURE_COST, NUM_KEYS, SCENARIOS  # noqa: E402
 
 # The broker advertises localhost:9094, and that port is forwarded to the cluster on IPv4 only. When
@@ -70,6 +72,8 @@ KEY_GROUPS = 120  # pipeline.max-parallelism of every job
 SETTLE_S = 105  # the measured phase starts when no job has restarted or rescaled for this long:
 # stabilization interval (30 s) + metric window (60 s) + one reconcile interval (15 s)
 METRIC_REFRESH_S = 1.0  # wait between asking Flink to refresh its metrics and reading them
+BURST = None  # --burst PERIOD_S:DUTY: the load leaves in bursts at the same average rate (Issue #141)
+START_WAIT = False  # --start-wait: the warm-up also waits until every job runs at the scenario's size (Issue #146)
 DRAIN_MAX = 240  # longest extra warm-up (s) spent waiting for every job to work off its backlog
 MIN_FREE_GB = 8  # below this the Rancher Desktop VM disk can go read-only mid-run (Issue #13)
 FETCH_BYTES = None  # max.partition.fetch.bytes for the jobs' Kafka consumers; None = Kafka default
@@ -153,8 +157,12 @@ SOURCE_VERTEX = "e5a72f353fc1e6bbf3bd96a41384998c"
 #                                     reader position (plugin class BrokerLag) instead of pendingRecords
 #   +rdN                              the Aggregate operator waits N seconds when it (re)starts, standing in
 #                                     for the restore of a large state
+#   +rrN                              the same delay on restores only, not on the first start: a job
+#                                     with it does not build a backlog in the warm-up (Issue #146)
+#   +advc +advl +advd                 marks the job as advised by an advisor outside the sizing loop: rules
+#                                     in code, an LLM or a decision model. Changes nothing in the job itself.
 #   +a ... +h                         a tag, to run several identical jobs side by side
-SPEC = re.compile(r"(builtin|rule|jev|llm)((\+(max\d\d|min\d\d|t\d\d|rt\d+|sonnet|opus|fable|f\d+|sp\d+|agg\d+|off|noplugin|lagfix|rd\d+|[a-h]))*)")
+SPEC = re.compile(r"(builtin|rule|jev|llm)((\+(max\d\d|min\d\d|t\d\d|rt\d+|sonnet|opus|fable|f\d+|sp\d+|agg\d+|off|noplugin|lagfix|rd\d+|rr\d+|advc|advl|advd|[a-h]))*)")
 
 
 def options(job):
@@ -226,6 +234,14 @@ def initial_parallelism(scenario, conf):
     return agg, measure
 
 
+def start_sizes(job, scenario, jev_overrides=None):
+    """(Aggregate, Measure) parallelism a job is started with: the scenario's size by the rule's formula,
+    unless the job spec fixes it (+aggN, +off). The start check compares the running job with this."""
+    o = options(job)
+    agg, measure = initial_parallelism(scenario, autoscaler_conf(job, jev_overrides))
+    return o.get("agg", agg), 1 if "off" in o else measure
+
+
 def job_args(job, run_id, scenario=None):
     """Program arguments of one job."""
     o = options(job)
@@ -237,17 +253,15 @@ def job_args(job, run_id, scenario=None):
     source = o.get("sp", SOURCE_PARALLELISM)
     if source:
         args += ["--source-parallelism", str(source)]
-    agg, measure = initial_parallelism(scenario, autoscaler_conf(job)) if scenario else (None, None)
-    if "agg" in o:
-        agg = o["agg"]
-    if "off" in o:
-        measure = 1
+    agg, measure = start_sizes(job, scenario) if scenario else (o.get("agg"), 1 if "off" in o else None)
     if agg:
         args += ["--agg-parallelism", str(agg)]
     if measure:
         args += ["--measure-parallelism", str(measure)]
     if "rd" in o:
         args += ["--restore-delay-ms", str(o["rd"] * 1000)]
+    if "rr" in o:
+        args += ["--restore-delay-ms", str(o["rr"] * 1000), "--restore-delay-first-start", "false"]
     return args
 
 
@@ -408,9 +422,9 @@ class LoadGenerator(threading.Thread):
         topics = [f"in-{safe(j)}-{self.run_id}" for j in JOBS]
         pad = b""
         rng = random.Random(f"{self.s.name}-keys")
-        carry = 0.0
-        last = time.time()
-        next_log = last
+        self.pacer = Pacer(*(BURST or (0.0, 1.0)))
+        self.pacer.due(0.0, time.time())
+        next_log = time.time()
         with open(self.out_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["t", "target_rate", "agg_cost_us", "hot_fraction", "sent_total"])
@@ -423,10 +437,7 @@ class LoadGenerator(threading.Thread):
                 # decision cycle does not meet them at the same phase in every repetition.
                 t = 0.0 if t0 is None else max(0.0, now - t0 - self.shift)
                 rate, cost, hot = self.s.rate(t), self.s.agg_cost(t), self.s.hot(t)
-                carry += rate * (now - last)
-                last = now
-                n = int(carry)
-                carry -= n
+                n = self.pacer.due(rate, now)
                 ms = int(now * 1000)
                 for _ in range(n):
                     if hot > 0 and rng.random() < hot:
@@ -513,6 +524,14 @@ class Sampler(threading.Thread):
 
     def lags(self):
         return {job: (r[-1][1] if r else None) for job, r in self.recent.items()}
+
+    def sizes(self):
+        """(Aggregate, Measure) parallelism of each job from its newest sample, None when not known."""
+        out = {}
+        for job, shape in self.shape.items():
+            size = tuple(shape[1 + VERTICES.index(v)] for v in ("aggregate", "measure")) if shape else (None,)
+            out[job] = None if None in size else size
+        return out
 
     @staticmethod
     def vertex_key(name):
@@ -739,13 +758,24 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
         # backlog it built while scaling up to the warm-up load (Issue #11), at most DRAIN_MAX longer.
         # The steady reading is about 10 s of input, because offsets are committed per checkpoint.
         # It also waits until no job has restarted or rescaled for SETTLE_S (Issue #31).
+        # Every run records whether the jobs begin the measured phase at the scenario's size
+        # (Issue #146). With --start-wait the warm-up also waits for that, inside the same bound.
         limit = s.rate(0) * 20 + 1000
-        while load.is_alive() and (time.time() - base < s.warmup or (
-                not (sampler.drained(limit) and sampler.settled(SETTLE_S)) and time.time() - base < s.warmup + DRAIN_MAX)):
+        initial = {j: initial_parallelism(s, autoscaler_conf(j, jev_overrides)) for j in JOBS}
+        wanted = {j: start_sizes(j, s, jev_overrides) for j in JOBS}  # differs from `initial` for +aggN and +off
+
+        def ready():
+            at_size = start_state(sampler.sizes(), wanted)["at_scenario_size"]
+            return jobs_ready(sampler.drained(limit), sampler.settled(SETTLE_S), at_size, START_WAIT)
+
+        while load.is_alive() and keep_warming(time.time() - base, s.warmup, DRAIN_MAX, ready()):
             time.sleep(5)
         drained, settled, lag_at_t0 = sampler.drained(limit), sampler.settled(SETTLE_S), sampler.lags()
+        start_at_t0 = start_state(sampler.sizes(), wanted)
+        start_at_t0["waited_for"] = START_WAIT
         clock.t0 = t0 = time.time() + 5
-        print(f"    warm-up {t0 - base:.0f}s, drained={drained}, settled={settled}, shift={shift}s, lag={lag_at_t0}", flush=True)
+        print(f"    warm-up {t0 - base:.0f}s, drained={drained}, settled={settled}, shift={shift}s, lag={lag_at_t0}, "
+              f"at scenario size={start_at_t0['at_scenario_size']}, equal={start_at_t0['equal']}, sizes={start_at_t0['sizes']}", flush=True)
         fault_times = None
         if FAULT:
             kind, start, length = FAULT
@@ -810,7 +840,7 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
             "scenario": name, "title": s.title, "rep": rep, "run_id": run_id,
             "t0_epoch": t0, "duration": s.duration, "warmup": round(t0 - base), "warmup_planned": s.warmup,
             "drained": drained, "settled": settled, "lag_at_t0": lag_at_t0, "events": [e + shift for e in s.events], "shift": shift,
-            "initial_parallelism": {j: initial_parallelism(s, autoscaler_conf(j, jev_overrides)) for j in JOBS},
+            "initial_parallelism": initial, "start": start_at_t0, "burst": list(BURST) if BURST else None,
             "metric_refresh": METRIC_REFRESH_S,
             "source_parallelism": SOURCE_PARALLELISM, "record_bytes": RECORD_BYTES, "partitions": PARTITIONS,
             "fault": fault_times,
@@ -837,7 +867,7 @@ def run_scenario(name, rep, out_root, jev_overrides=None):
 
 
 def main():
-    global JOBS, FETCH_BYTES, SOURCE_PARALLELISM, RECORD_BYTES, PARTITIONS, JITTER, FAULT
+    global JOBS, FETCH_BYTES, SOURCE_PARALLELISM, RECORD_BYTES, PARTITIONS, JITTER, FAULT, START_WAIT, BURST
     # On macOS, keep the machine awake for the whole benchmark; a sleeping laptop freezes the cluster.
     if sys.platform == "darwin" and not os.environ.get("BENCH_CAFFEINATED"):
         os.environ["BENCH_CAFFEINATED"] = "1"
@@ -869,13 +899,24 @@ def main():
         sp.add_argument("--jitter", type=int, default=0,
                         help="delay the scenario's changes by a random time of up to this many seconds per run")
         sp.add_argument("--llm-model", default=LLM_AUTOSCALER["job.autoscaler.jev.llm.model"])
+        sp.add_argument("--burst", default=None, metavar="PERIOD_S:DUTY",
+                        help="send every period's records in the first DUTY share of the period, at the same "
+                             "average rate, e.g. 1:0.2")
+        sp.add_argument("--start-wait", action="store_true",
+                        help="the warm-up also waits until every job runs at the scenario's size, inside its usual "
+                             "bound; without it the state is only recorded in meta.json as 'start'")
         sp.add_argument("--fetch-bytes", type=int, default=None,
                         help="max.partition.fetch.bytes of the jobs' Kafka consumers (default: Kafka's 1 MiB); "
                              "a small value such as 4096 keeps Flink's pendingRecords close to the real lag")
     args = ap.parse_args()
     JOBS = tuple(args.jobs.split(","))
     SOURCE_PARALLELISM, RECORD_BYTES = args.source_parallelism, args.record_bytes
-    PARTITIONS, JITTER = args.partitions, args.jitter
+    PARTITIONS, JITTER, START_WAIT = args.partitions, args.jitter, args.start_wait
+    if args.burst:
+        try:
+            BURST = parse_burst(args.burst)
+        except ValueError as e:
+            raise SystemExit(str(e))
     if args.windows == "long":
         COMMON_AUTOSCALER.update({
             "job.autoscaler.metrics.window": "5m", "job.autoscaler.stabilization.interval": "2m",

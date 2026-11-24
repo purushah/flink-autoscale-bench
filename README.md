@@ -274,6 +274,8 @@ runs: 16 subtasks per vertex). The test is exploratory. Its results are sections
 | `cluster/bench/beliefs.py` | What the rule believed (demand and backlog) at its first evaluation on a full window of overload in the cluster signal campaign, against the truth: `python3 cluster/bench/beliefs.py results-cluster/signal surge 60 125` |
 | `cluster/bench/keepreplay.py`, `queue_keepfix.sh` | The margin on the size a scale-down keeps (`scale-down.window-keeps-margin`, ISSUES.md #119, second cause): a replay on recorded on-off runs and the queue of its test |
 | `bench/e4_start.py`, `bench/e4_blocks.py` | The campaign with every restart 60 s longer: the contrasts by block, and the state of the jobs when the measured phase begins and when the load changes (they had rescaled in the warm-up; ISSUES.md #146): `python3 bench/e4_start.py` |
+| `cluster/bench/escore.py` | Test E, the step-aware demand with the first reading of a rise taken over two seconds (FINDINGS.md section 16, last subsection): first orders and seconds until the covering size runs, `python3 cluster/bench/escore.py results-cluster/stepfix2`; the step lines are read with `stepnow.py` |
+| `bench/startcheck.py`, `bench/pacing.py`, `bench/tests/` | Added on 23 November after every run of the paper and of Tests D and E. Both harnesses now write the state of the jobs at the start of the measured phase into `meta.json` (`start`: sizes, at the scenario's size, equal; ISSUES.md #146) and wait for it with `--start-wait`; the load generators can send in bursts at the same average rate (`--burst PERIOD_S:DUTY`, ISSUES.md #141); the job option `+rrN` delays restores only, not the first start (the job argument `--restore-delay-first-start false`; rebuild the job image first). Unit tests: `python3 -m pytest bench/tests -q` |
 | `cluster/plugin/` | The plugin with four more settings (below). The laptop campaigns use `jev-autoscaler-plugin/`, which does not have them |
 | `cluster/flink-job/` | The benchmark job built for Flink 2.x |
 | `cluster/deploy/` | Dockerfiles, `cluster.example.json`, and `make_conf.py`, which derives the cluster's settings and the test's own objects (operator, driver pod, service accounts) from a job that already runs in the namespace |
@@ -285,7 +287,9 @@ this repository's first commit (6f1a803). The source has changed since in three 
 paper has run: the reading of the end offsets within one cycle counts at the first step line of a rise
 only; at that line a third reading two seconds after the first replaces it (`lag.step-confirm-seconds`);
 and a scale-down that is kept for an earlier level gets a margin (`scale-down.window-keeps-margin`). The
-runs at the operator's default time settings switch on none of these options.
+runs at the operator's default time settings switch on none of these options. Two tests after the paper's
+data collection ran these changes: Test D the margin (operator image of the second commit's source) and
+Test E the two changes to the step line (FINDINGS.md sections 15 and 16). Neither is in the paper.
 
 Settings that `cluster/plugin` adds (under `job.autoscaler.jev.`) and the harness option that sets each for
 one job of a run:
