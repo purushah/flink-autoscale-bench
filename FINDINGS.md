@@ -2085,9 +2085,11 @@ opportunity.
   the LLM chose 15.
 - The LLM chose the policy's size at every decision of both runs.
 
-The six runs were not made. A choice between 15 and 16 subtasks where 6 suffice says nothing about
-whether the LLM uses its latitude to any effect, and the plan's condition ("at least one opportunity")
-was too weak. No outcome of either run (time over the limit, slots) was read.
+The six runs were not made. The second run met the plan's condition for going on ("at least one
+opportunity"), but its only larger choice at saturation was 16 subtasks against 15, where about 6 keep
+up with the load. One more subtask might still have worked the backlog off a little sooner; we judged
+the difference too small for six paired runs and stopped. No outcome of either run (time over the
+limit, slots) was read, so nothing is known about it.
 
 What it says: the missing room is not an effect of the laptop's limit of 8 subtasks. With the default
 signal the policy's second step goes to the largest size or next to it, also where the load needs less
@@ -2105,11 +2107,18 @@ the bottleneck inside the overload; `roomsum.py --tally`):
 | Cluster design check, to 4,800 records/s | 1 | 3 | 2 (1) | 0 | 0 | 0 |
 | Cluster design check, to 2,400 records/s | 1 | 10 | 10 (1) | 0 | 0 | 0 |
 
-Of the 48 decisions with a larger size on offer, 46 had a busy time of 0.25 to 0.71 (25 first steps on
-a window of mostly old load, 21 cycles in which the policy held its size). The bottleneck was saturated
+Of the 48 decisions with a larger size on offer, 46 had a busy time of 0.25 to 0.71 (23 first scale-ups
+on a window of mostly old load, 21 cycles in which the policy held its size, 2 scale-downs). The bottleneck was saturated
 at two: one in the later campaign (run 4, 127 s after the rise: the policy's 6 of up to 8, the prompt's
 situation held, the LLM chose 6 and its job needed a third step) and one in the second design check
-(15 of up to 16). In the main campaign's short scenarios the LLM went above the policy twice, both
+(15 of up to 16). The zero in the last column is for the bottleneck. For Measure, the vertex after it,
+the LLM chose a larger size than the policy at 5 of 388 decisions inside these overloads, and each was
+applied (overload campaign: run 1 with the default signal, 3 against 2, and run 11, 2 against 1; run 6
+with the broker-side signal, 4 against 2; later campaign: run 1, 4 against 3, and run 4, 2 against 1).
+All counts are for the time the overload lasted. After it, the LLM chose above the policy for the
+bottleneck once in these runs: 56 s after the end of the overload it chose 6 subtasks where the policy
+gave 4 (later campaign, run 5).
+In the main campaign's short scenarios the LLM went above the policy twice for the bottleneck, both
 after a spike had ended (section 14).
 
 Reproduce: `python3 cluster/bench/roomsum.py <campaign dir> <scenario> llm` lists the opportunities of a
