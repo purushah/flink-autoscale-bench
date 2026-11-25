@@ -2094,6 +2094,25 @@ signal the policy's second step goes to the largest size or next to it, also whe
 than half of that, and the latitude in the LLM's prompt (more than the policy, never less) has nothing
 to act on. A test of the LLM's judgment needs a policy that leaves room, or a latitude to choose less.
 
+How often the LLM had a choice, over all runs with a sustained overload (decisions of the LLM's job for
+the bottleneck inside the overload; `roomsum.py --tally`):
+
+| Runs | n | Decisions | A size above the policy's on offer (runs) | The prompt's situation held | Both | Chose above the policy |
+|---|---|---|---|---|---|---|
+| Overload campaign, default signal (`results-e10/default`) | 12 | 31 | 19 (12) | 2 | 0 | 0 |
+| Overload campaign, broker-side signal (`results-e10/broker`) | 12 | 30 | 8 (8) | 0 | 0 | 0 |
+| Later campaign, default signal (`results-e3b/default`) | 6 | 15 | 9 (6) | 3 | 1 | 0 |
+| Cluster design check, to 4,800 records/s | 1 | 3 | 2 (1) | 0 | 0 | 0 |
+| Cluster design check, to 2,400 records/s | 1 | 10 | 10 (1) | 0 | 0 | 0 |
+
+Of the 48 decisions with a larger size on offer, 46 had a busy time of 0.25 to 0.71 (25 first steps on
+a window of mostly old load, 21 cycles in which the policy held its size). The bottleneck was saturated
+at two: one in the later campaign (run 4, 127 s after the rise: the policy's 6 of up to 8, the prompt's
+situation held, the LLM chose 6 and its job needed a third step) and one in the second design check
+(15 of up to 16). In the main campaign's short scenarios the LLM went above the policy twice, both
+after a spike had ended (section 14).
+
 Reproduce: `python3 cluster/bench/roomsum.py <campaign dir> <scenario> llm` lists the opportunities of a
-campaign (tests: `bench/tests/test_roomsum.py`). The two design-check runs are
+campaign, and with `--tally` the counts of the table, e.g. `python3 cluster/bench/roomsum.py
+results-e10/broker surge llm+lagfix --tally` (tests: `bench/tests/test_roomsum.py`). The two design-check runs are
 `results-cluster/llm-room-pilot/surge/rep1` and `results-cluster/llm-room2-pilot/surge_mid/rep1`.

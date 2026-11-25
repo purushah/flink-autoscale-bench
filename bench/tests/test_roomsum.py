@@ -13,7 +13,7 @@ META = {"t0_epoch": T0, "events": [60, 540], "duration": 660}
 
 def decision(t, job, busy, rule_choice, choice, offered="p3..p16", demand=1500.0, cap=400.0, current=4, name="Aggregate"):
     ts = __import__("datetime").datetime.fromtimestamp(T0 + t, __import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f000Z")
-    return {"event": "decision", "ts": ts, "job": f"JobKey{{name='bench-{job}'}}", "vertices": {"v1": {
+    return {"event": "decision", "ts": ts, "job": f"JobKey{{name='bench-{job.replace('+', '-')}'}}", "vertices": {"v1": {
         "name": name, "current": current, "offered": offered, "rule_choice": rule_choice, "choice": f"p{choice}",
         "busy": busy, "demand": demand, "capacity_per_subtask": cap}}}
 
@@ -50,3 +50,16 @@ def test_offered_sizes_may_be_a_range_or_a_list(tmp_path):
     assert roomsum.largest_offered("p3..p16") == 16
     assert roomsum.largest_offered("p2,p4,p8") == 8
     assert roomsum.largest_offered("p6") == 6
+
+
+def test_the_tally_counts_room_the_prompts_condition_and_choices_above_the_policy(tmp_path):
+    p = write(tmp_path, [
+        decision(30, "llm", 1.0, 6, 6),                              # before the overload
+        decision(70, "llm", 0.40, 4, 4, offered="p2..p8", current=2, demand=500.0),   # room, not saturated
+        decision(120, "llm", 0.99, 6, 6, demand=1500.0),             # room, the prompt's condition (1500 < 4 x 400), stays
+        decision(180, "llm", 0.97, 8, 16, demand=1700.0),            # room, saturated, demand above the capacity, goes above
+        decision(240, "llm", 1.0, 16, 16, demand=1500.0),            # condition, no room
+        decision(300, "llm+lagfix", 1.0, 6, 8, demand=1700.0),       # another job: room, demand above the capacity, goes above
+    ])
+    assert roomsum.tally(p, META, "llm") == {"decisions": 4, "larger": 3, "condition": 2, "both": 1, "chose_larger": 1, "chose_larger_both": 0}
+    assert roomsum.tally(p, META, "llm+lagfix") == {"decisions": 1, "larger": 1, "condition": 0, "both": 0, "chose_larger": 1, "chose_larger_both": 0}
