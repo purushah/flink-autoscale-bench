@@ -1984,7 +1984,7 @@ results-cluster/state-alone surge_long --without 4` (the planned output of both 
 `results-cluster/state-alone/statesum-planned.txt`; the monitoring service's numbers are in
 `results-cluster/state-alone/datadog.json`).
 
-### Test I: the same pair without state (6 runs, all counted): the gain is there, in every run, and no stall
+### Test I: the same pair without the added state (6 runs, all counted): the gain is there, in every run, and no stall
 
 Why: Test H had no run of the same design without state. No earlier campaign had both the 40-minute
 overload and the one-minute window, so Test H alone could not tell whether its missing gain belongs to
@@ -1993,8 +1993,10 @@ the state or to the settings. An outside review asked for this control on 24 Nov
 Design, fixed in writing before the first run (plan entry of 24 Nov 13:09 PST): Test H's pair without
 state, `builtin` and `builtin+lagfix`, shipped band, `surge_long` (400 to 4,800 records/s for 40
 minutes, measured phase 2,880 s), scale 2, one-minute windows, every pod on a node of its own, the
-same start rules. It differs from Test H in everything that `+st4` sets: the state and its backend,
-the TaskManagers' memory and the local disk. No stop rule and no look at an outcome before the last
+same start rules. The jobs keep their own small keyed state (counts and sums); "without state" below
+means without the 4 GiB that `+st4` adds. The test differs from Test H in everything that `+st4` sets:
+the added state and the RocksDB backend, the TaskManagers' memory (6,144 MiB against 1,024), their CPUs
+(2 against 0.5), RocksDB's four background threads and the local disk. No stop rule and no look at an outcome before the last
 run; only the checks of each copied run. Measure: seconds over the latency limit by the laptop's
 definition, as in Test H.
 
@@ -2033,15 +2035,18 @@ What it says:
   the jobs hold no state: with one step from 2 to 16 subtasks where the default-signal rule needs two
   or three steps, 148 s sooner at the size that covers the load.
 - Test H's two jobs reached that size about as soon (202 and 51 s against 215 and 67 s here) and were
-  then over the limit for 1,110 and 1,272 s against 579 and 194 s here. So what Test H did not show is
-  lost after the first steps, with the state or with what was changed for it. The two tests differ in
-  the state and its backend, the TaskManagers' memory and the local disk together, so they do not say
-  which of these it is.
+  then over the limit for 1,110 and 1,272 s against 579 and 194 s here. Whatever kept Test H from
+  showing the gain acts after the first steps. The two tests differ in the added state and its backend,
+  the TaskManagers' memory, their CPUs and the local disk together, and they ran one after the other,
+  so they do not say which of these it is, or whether the benefit itself changed.
 - The stalls of Test H (12 of 63 to 214 s in five job-runs) have no counterpart here: 19 stops, none
   longer than 11 s. They go with the state or its settings, and not with the load, the windows or the
   placement.
 - Test H's interval (-1,247 to +1,571 s) includes this test's -385 s. Test H neither shows that gain
-  nor rules it out.
+  nor rules it out: at 4 GiB the estimate is too imprecise to say whether the benefit changed. The
+  paper words it so, and does not say that the gain is lost with the state (an outside review of
+  24 Nov; the plan's sentence written before the test, "what Test H did not show goes with the state
+  and its stalls", claims more than the two tests carry).
 - The stop that begins at a change of size (not planned, `rescalestop.py`): 1, 2 and 4 s at the
   quartiles and at most 11 s over 47 changes, against 3, 9 and 15 s and at most 30 s over 87 changes
   in Test H. With 4 GiB of state a rescale stopped the output for about 7 s longer in the median, and
