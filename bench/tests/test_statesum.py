@@ -176,3 +176,14 @@ def test_the_state_of_a_run_without_state_is_zero():
     assert statesum.state_sizes({"jobs": ["a", "b"]}) == (0.0, {"a": 0.0, "b": 0.0})
     m = {"jobs": ["a", "b"], "state": {"wanted": {"a": 2**32, "b": 2**32}, "bytes": {"a": 2**31, "b": None}}}
     assert statesum.state_sizes(m) == (4.0, {"a": 2.0, "b": 0.0})
+
+
+def test_a_named_pair_is_taken_as_given_for_jobs_without_the_signal_option():
+    # the comparison of the policy in code with the LLM: reference first, compared job second
+    assert statesum.pair(["llm", "rule"], named=("rule", "llm")) == ("rule", "llm")
+    assert statesum.pair(["builtin", "builtin+lagfix"]) == ("builtin", "builtin+lagfix")
+    import pytest
+    with pytest.raises(ValueError):
+        statesum.pair(["llm", "rule"], named=("rule", "jev"))
+    with pytest.raises(ValueError):
+        statesum.pair(["llm", "rule"])

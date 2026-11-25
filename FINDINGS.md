@@ -2062,3 +2062,38 @@ cluster/bench/statesum.py results-cluster/state-none surge_long`, `python3 clust
 results-cluster/state-none surge_long` (the planned output is kept in
 `results-cluster/state-none/statesum-planned.txt`; the monitoring service's numbers are in
 `results-cluster/state-none/datadog.json`).
+
+## 19. A test of the LLM's latitude on the cluster was planned and not run: the policy leaves no room (two design checks, 24 Nov)
+
+Why: in the laptop's overload campaign no decision gave the LLM room above the policy's choice while
+the situation its prompt names held, and a later campaign gave it one (it stayed with the policy).
+Two outside reviews asked for a test with repeated room during an overload.
+
+Plan, written before any run (plan entry of 24 Nov 19:47 PST): on the cluster (16 subtasks at most),
+the policy in code (`rule`) and the LLM (`llm`) side by side with the default signal in an
+eight-minute overload; an opportunity is a decision of the LLM's job for Aggregate inside the overload
+with a busy time of at least 95% at which the policy's choice is below the largest size on offer; one
+design-check run of which only the decision log is read, then six paired runs if it shows an
+opportunity.
+
+- First design, the overload to 4,800 records/s (10 to 12 subtasks keep up): no opportunity. Both jobs
+  took a first step 19 to 20 s after the rise on a window of mostly old load (busy time 0.43 and 0.46;
+  the policy chose 4 and 5 of up to 8), and at their second decision, 128 and 141 s after the rise,
+  the policy asked for 16, the largest size.
+- Second design, the overload to 2,400 records/s (about 6 subtasks keep up): one opportunity, 121 s
+  after the rise, at 4 subtasks with a busy time of 1.00: the policy's choice was 15 of up to 16, and
+  the LLM chose 15.
+- The LLM chose the policy's size at every decision of both runs.
+
+The six runs were not made. A choice between 15 and 16 subtasks where 6 suffice says nothing about
+whether the LLM uses its latitude to any effect, and the plan's condition ("at least one opportunity")
+was too weak. No outcome of either run (time over the limit, slots) was read.
+
+What it says: the missing room is not an effect of the laptop's limit of 8 subtasks. With the default
+signal the policy's second step goes to the largest size or next to it, also where the load needs less
+than half of that, and the latitude in the LLM's prompt (more than the policy, never less) has nothing
+to act on. A test of the LLM's judgment needs a policy that leaves room, or a latitude to choose less.
+
+Reproduce: `python3 cluster/bench/roomsum.py <campaign dir> <scenario> llm` lists the opportunities of a
+campaign (tests: `bench/tests/test_roomsum.py`). The two design-check runs are
+`results-cluster/llm-room-pilot/surge/rep1` and `results-cluster/llm-room2-pilot/surge_mid/rep1`.

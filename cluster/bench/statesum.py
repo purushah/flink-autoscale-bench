@@ -24,8 +24,13 @@ LIMIT_MS = 2000.0
 FILL_S = 3  # a second without output takes the latency of the second before it for up to this many seconds
 
 
-def pair(jobs):
-    """(default, broker): the job without and the job with the broker-side signal (+lagfix)."""
+def pair(jobs, named=None):
+    """(default, broker): the job without and the job with the broker-side signal (+lagfix). With
+    named=(a, b), for two jobs that do not differ in the signal: (a, b), the reference first."""
+    if named:
+        if len(jobs) != 2 or set(named) != set(jobs):
+            raise ValueError(f"expected the jobs {named}, got {jobs}")
+        return tuple(named)
     with_fix = [j for j in jobs if "lagfix" in j.split("+")]
     without = [j for j in jobs if "lagfix" not in j.split("+")]
     if len(jobs) != 2 or len(with_fix) != 1 or len(without) != 1:
@@ -146,6 +151,11 @@ def main():
         i = argv.index("--tex")
         tex = (argv[i + 1], argv[i + 2])
         argv = argv[:i] + argv[i + 3:]
+    named = None
+    if "--pair" in argv:  # two jobs that do not differ in the signal: reference first, e.g. --pair rule,llm
+        i = argv.index("--pair")
+        named = tuple(argv[i + 1].split(","))
+        argv = argv[:i] + argv[i + 2:]
     camp = argv[0]
     scenario = argv[1] if len(argv) > 1 else "surge"
     runs = sorted((d for d in glob.glob(os.path.join(camp, scenario, "rep*")) if d.rsplit("rep", 1)[1].isdigit()),
@@ -163,7 +173,7 @@ def main():
         if not ok:
             unready.append((rep, missing))
             continue
-        names = pair(m["jobs"])
+        names = pair(m["jobs"], named)
         gib, held = state_sizes(m)
         for job, v in h.items():
             x = dd.get(f"{scenario}/{rep}", {}).get(job)
@@ -203,7 +213,8 @@ def main():
         per = sum(every_stop) / n_rescales
         print(f"   without output: {sum(every_stop)} s in {len(every_stop)} stops of {min(every_stop)} to {max(every_stop)} s, over {n_rescales} rescales: {per:.1f} s per rescale")
         mac.update({"DownPerRescale": f"{per:.0f}", "StopMin": str(min(every_stop)), "StopMax": str(max(every_stop))})
-    print("\nbroker-side signal minus default signal, paired within runs (mean [95% t interval], lower in k of n)")
+    print(f"\n{b} minus {a}, paired within runs (mean [95% t interval], lower in k of n)" if named else
+          "\nbroker-side signal minus default signal, paired within runs (mean [95% t interval], lower in k of n)")
     for label, key, name, digits in (("seconds over the limit", "late", "Over", 0), ("the monitoring service's counter", "dd_over", "Counter", 0),
                                      ("slots held, monitoring service", "dd_slots", "Slots", 2), ("scale-ups of Aggregate", "ups", "Ups", 2),
                                      ("rescales", "rescales", "Rescales", 2), ("seconds without output in stops", "down", "Down", 0),
@@ -218,7 +229,7 @@ def main():
         line = f"   {label:<44} {m_:+8.2f} [{lo:+8.2f}, {hi:+8.2f}]  lower in {sum(x < 0 for x in diff)} of {len(diff)}"
         if key == "late":  # the one planned test
             p = sign_flip_p(diff)
-            line += f"  {100 * m_ / base:+5.0f}% of the default's {base:.0f} s  exact p {p:.4f}"
+            line += f"  {100 * m_ / base:+5.0f}% of {a + chr(39) + 's' if named else 'the default' + chr(39) + 's'} {base:.0f} s  exact p {p:.4f}"
             mac.update({"OverP": f"{p:.3f}", "OverShare": f"{-100 * m_ / base:.0f}", "OverLower": str(sum(x < 0 for x in diff))})
         print(line + "  by run " + ", ".join(f"{x:+.{digits}f}" for x in diff))
         if name:
