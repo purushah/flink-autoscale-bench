@@ -1719,7 +1719,7 @@ lengthen a job's time over the limit; six runs cannot show an interference below
 Reproduce: `python3 bench/paper.py main` (and `e2c`, `e5`, `e4`, `e9`, `e2`), `python3 bench/main_marked.py`,
 `python3 bench/e2c_pairs.py`, `python3 bench/e4_blocks.py`, `python3 cluster/bench/decount.py <run dirs>`.
 
-## 18. On a job with 4 GiB of state the broker-side signal did not shorten the time over the limit (Tests F, G and H, 24 Nov, planned, after the paper's data cut-off)
+## 18. On a job with 4 GiB of state the broker-side signal did not shorten the time over the limit; in the same test without state it did (Tests F, G, H and I, 24 Nov, planned, after the paper's data cut-off)
 
 Section 13 is from a job without state worth the name: a restart cost 3.6 s without output. An outside
 review asked for one paired test in which a rescale is expensive. These are three attempts at that test.
@@ -1983,3 +1983,77 @@ surge_long --without 4` and the same without the option, `python3 cluster/bench/
 results-cluster/state-alone surge_long --without 4` (the planned output of both summaries is kept in
 `results-cluster/state-alone/statesum-planned.txt`; the monitoring service's numbers are in
 `results-cluster/state-alone/datadog.json`).
+
+### Test I: the same pair without state (6 runs, all counted): the gain is there, in every run, and no stall
+
+Why: Test H had no run of the same design without state. No earlier campaign had both the 40-minute
+overload and the one-minute window, so Test H alone could not tell whether its missing gain belongs to
+the state or to the settings. An outside review asked for this control on 24 Nov.
+
+Design, fixed in writing before the first run (plan entry of 24 Nov 13:09 PST): Test H's pair without
+state, `builtin` and `builtin+lagfix`, shipped band, `surge_long` (400 to 4,800 records/s for 40
+minutes, measured phase 2,880 s), scale 2, one-minute windows, every pod on a node of its own, the
+same start rules. It differs from Test H in everything that `+st4` sets: the state and its backend,
+the TaskManagers' memory and the local disk. No stop rule and no look at an outcome before the last
+run; only the checks of each copied run. Measure: seconds over the latency limit by the laptop's
+definition, as in Test H.
+
+Runs: six runs between 21:19Z on 24 Nov and 03:01Z on 25 Nov. All six are clean, started as planned,
+and no node held two Flink pods. All count.
+
+| Run | Default signal, s over the limit | Broker-side signal | Difference | Sizes of Aggregate, default | broker-side |
+|---|---|---|---|---|---|
+| 1 | 741 | 214 | -527 | 2, 4, 8, 16, 8 | 2, 16, 8 |
+| 2 | 571 | 188 | -383 | 2, 5, 12, 16, 8 | 2, 16, 8 |
+| 3 | 504 | 200 | -304 | 2, 6, 15, 16, 8 | 2, 16, 8 |
+| 4 | 487 | 187 | -300 | 2, 6, 16, 10 | 2, 16, 10 |
+| 5 | 566 | 194 | -372 | 2, 4, 12, 16, 8 | 2, 16, 8 |
+| 6 | 604 | 180 | -424 | 2, 4, 10, 16, 8 | 2, 16, 8 |
+
+| | Default signal | Broker-side signal | Difference [95%] | Lower in |
+|---|---|---|---|---|
+| Seconds over the limit (the test's measure) | 578.8 | 193.8 | -385.0 [-473.6, -296.4] | 6 of 6, exact p = 0.0312 |
+| The monitoring service's counter | 555.3 | 185.2 | -370.2 [-453.9, -286.5] | 6 of 6 |
+| Slots held (monitoring service) | 14.34 | 15.07 | +0.73 [+0.52, +0.95] | 0 of 6 |
+| Scale-ups of Aggregate | 2.83 | 1.00 | -1.83 [-2.26, -1.40] | 6 of 6 |
+| Rescales | 5.00 | 2.83 | -2.17 [-3.39, -0.94] | 6 of 6 |
+| Seconds until the load is covered | 215 | 67 | -147.5 [-204.3, -90.7] | 6 of 6 |
+
+Predictions, all five held:
+
+- I0 holds: 103 s without output in 19 stops of 3 to 11 s over 47 rescales, 2.2 s per rescale (under 10 s).
+- I1, the one test, holds: fewer seconds over the limit in 6 of 6 runs, exact p = 0.0312.
+- I2 holds: -385 s, below -150 s. That is 67% of the default job's 579 s.
+- I3 holds: no stop of 60 s or more. The longest is 11 s.
+- I4 holds: +0.73 slots, in 6 of 6 runs.
+
+What it says:
+
+- At Test H's load, windows and placement the broker-side signal shortens the time over the limit when
+  the jobs hold no state: with one step from 2 to 16 subtasks where the default-signal rule needs two
+  or three steps, 148 s sooner at the size that covers the load.
+- Test H's two jobs reached that size about as soon (202 and 51 s against 215 and 67 s here) and were
+  then over the limit for 1,110 and 1,272 s against 579 and 194 s here. So what Test H did not show is
+  lost after the first steps, with the state or with what was changed for it. The two tests differ in
+  the state and its backend, the TaskManagers' memory and the local disk together, so they do not say
+  which of these it is.
+- The stalls of Test H (12 of 63 to 214 s in five job-runs) have no counterpart here: 19 stops, none
+  longer than 11 s. They go with the state or its settings, and not with the load, the windows or the
+  placement.
+- Test H's interval (-1,247 to +1,571 s) includes this test's -385 s. Test H neither shows that gain
+  nor rules it out.
+- The stop that begins at a change of size (not planned, `rescalestop.py`): 1, 2 and 4 s at the
+  quartiles and at most 11 s over 47 changes, against 3, 9 and 15 s and at most 30 s over 87 changes
+  in Test H. With 4 GiB of state a rescale stopped the output for about 7 s longer in the median, and
+  the jobs rescaled more often (7.5 and 7.0 times per run against 5.0 and 2.8).
+- Limits: six runs of one load shape on one cluster, on the same day as Test H (Test H 13:06Z to
+  19:46Z, this test 21:19Z to 03:01Z), with the same driver pod. The two tests are not interleaved, so
+  a difference between them can also hold a difference between two times of day on a shared cluster.
+  The two tests are not interleaved, so a difference between them can also hold a difference between
+  the afternoon and the evening on a shared cluster.
+
+Reproduce: `python3 cluster/bench/disturbed_cluster.py results-cluster/state-none surge_long`, `python3
+cluster/bench/statesum.py results-cluster/state-none surge_long`, `python3 cluster/bench/rescalestop.py
+results-cluster/state-none surge_long` (the planned output is kept in
+`results-cluster/state-none/statesum-planned.txt`; the monitoring service's numbers are in
+`results-cluster/state-none/datadog.json`).
