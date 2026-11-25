@@ -1913,7 +1913,19 @@ The predictions:
 - H0 holds by its definition: 2,953 s without output in 123 stops over 87 rescales, 33.9 s per rescale.
   Most of that is the stalls described below. Without the stops of 60 s or more it is 13.3 s per
   rescale (1,155 s over 87), less than the 20 s the test wanted, so a plain rescale was cheaper here
-  than planned for.
+  than planned for. Timed directly (not planned, `cluster/bench/rescalestop.py`): the stop in the output
+  that begins at a change of size took 3, 9 and 15 s at the quartiles and at most 30 s, over the 87
+  changes of the counted runs (default job 2, 9, 14.5 s; broker-side job 3, 7.5, 16.2 s). In Test F,
+  on shared disks, the same reading gives 22.5, 32 and 54.5 s and up to 217 s. The reading has a
+  limit, pointed out by an outside review on 24 Nov: it only counts a stop that begins near the
+  change. At 84 of the 87 changes the job was seen running at the new size within 20 s of its last
+  sample at the old size. At 3 it was not seen running for 125, 125 and 175 s (run 7, default job,
+  from 1,466 s and from 1,951 s; run 6, broker-side job, from 1,086 s). Each of these lies inside a
+  stall that began 41 to 53 s before the last sample at the old size, the reading gives them 15, 14
+  and 16 s for a separate short stop, and the data do not tell the restore from the stall there. Six
+  more changes follow a stop that began earlier and ended as the matching window opened. So for 84 of
+  87 changes a restore of 4 GiB was short in Test H; for 3 it is not known. What a costly restore does
+  to the comparison is still open.
 - H1 holds: under 2,400 s in 5 of 6 counted runs.
 - H2, the one test, fails: fewer seconds over the limit in 2 of 6 runs, exact p = 0.66.
 - H3 fails: +162 s, not below -283 s.
@@ -1927,7 +1939,7 @@ covered 148.6 s sooner in 7 of 7; 0.46 slots more in 7 of 7.
 What it says:
 
 - With 4 GiB of state the broker-side signal still made the rule act sooner. The job ran at the size
-  the load needs 151 s sooner in every run, for half a slot more.
+  the load needs sooner in every run, by 125 to 205 s (151 s on average), for half a slot more.
 - The test did not show a shorter time over the limit. The broker-side job was over the limit for
   longer in 4 of 6 runs. The interval is about 1,400 s wide either way and contains the gain of the
   stateless test by this measure (-283 s), so the test neither shows that gain nor rules it out.
@@ -1967,6 +1979,7 @@ Not planned, looked at after the outcome (it explains, it does not test):
 Reproduce: `python3 cluster/bench/disturbed_cluster.py results-cluster/state-alone surge_long`, `python3
 cluster/bench/ownfail.py results-cluster/state-alone surge_long`, `python3 cluster/bench/nodewait.py
 results-cluster/state-alone surge_long`, `python3 cluster/bench/statesum.py results-cluster/state-alone
-surge_long --without 4` and the same without the option (the planned output of both is kept in
+surge_long --without 4` and the same without the option, `python3 cluster/bench/rescalestop.py
+results-cluster/state-alone surge_long --without 4` (the planned output of both summaries is kept in
 `results-cluster/state-alone/statesum-planned.txt`; the monitoring service's numbers are in
 `results-cluster/state-alone/datadog.json`).

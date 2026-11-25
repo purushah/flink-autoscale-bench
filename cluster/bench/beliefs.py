@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Cluster signal campaign: what the rule believed at its first evaluation in a range of seconds after the
-rise (60 to 125 s: the one-minute window lies wholly inside the overload), against the truth from the
-harness samples. Written by a reviewer in round 3 and checked in round 4; not a planned analysis.
+rise, against the truth from the harness samples. From 60 s on the one-minute window lies wholly inside
+the overload. Use 60 to 480 for the eight-minute overload: with 60 to 125, as first run, two of the
+eight default-signal jobs have no evaluation in the range (theirs come at 163 and 164 s, at 5 and 6
+subtasks), and the paper said "six of eight runs" until 24 Nov (ISSUES.md #185).
+Written by a reviewer in round 3 and checked in round 4; not a planned analysis.
    python3 beliefs.py <campaign dir, e.g. results-cluster/signal> <scenario> <from s> <to s>"""
 import json, os, sys, csv, datetime, collections, bisect
 ROOT=sys.argv[1]

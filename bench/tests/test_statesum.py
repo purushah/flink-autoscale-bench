@@ -151,3 +151,28 @@ def test_the_shared_reader_of_a_run_takes_a_latency_file_with_a_block_of_zero_by
         f.write(bytes(200_000) + b"a,1795539014.0,6,421,448984,493036,601116,603166\r\n")
     assert statesum.harness(str(tmp_path))[1] == want
     assert want["a"]["over"] == 1
+
+
+READY = {"drained": True, "settled": True, "start": {"at_scenario_size": True, "equal": True}}
+
+
+def test_a_run_of_jobs_without_state_begins_as_planned_without_a_state_in_a_checkpoint():
+    # The control of Test H (plan entry of 2026-11-24 13:09 PST): the same pair, the jobs hold no state,
+    # and the harness writes no state block into meta.json.
+    assert statesum.started_ready(dict(READY, state=None)) == (True, [])
+    assert statesum.started_ready(READY) == (True, [])
+
+
+def test_a_run_of_jobs_with_state_still_needs_the_state_in_a_checkpoint():
+    assert statesum.started_ready(dict(READY, state={"filled": False})) == (False, ["state filled"])
+    assert statesum.started_ready(dict(READY, state={"filled": True})) == (True, [])
+
+
+def test_a_run_that_did_not_settle_is_not_ready_with_or_without_state():
+    assert statesum.started_ready(dict(READY, settled=False)) == (False, ["settled"])
+
+
+def test_the_state_of_a_run_without_state_is_zero():
+    assert statesum.state_sizes({"jobs": ["a", "b"]}) == (0.0, {"a": 0.0, "b": 0.0})
+    m = {"jobs": ["a", "b"], "state": {"wanted": {"a": 2**32, "b": 2**32}, "bytes": {"a": 2**31, "b": None}}}
+    assert statesum.state_sizes(m) == (4.0, {"a": 2.0, "b": 0.0})

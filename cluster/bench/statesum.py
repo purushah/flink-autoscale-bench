@@ -115,12 +115,23 @@ def rescales(samples_csv, job, duration):
 
 
 def started_ready(m):
-    """Whether the run began as the plan asks, and what was missing if not."""
-    start, state = m.get("start") or {}, m.get("state") or {}
-    missing = [name for name, ok in (("drained", m.get("drained")), ("settled", m.get("settled")),
-                                     ("at the scenario's size", start.get("at_scenario_size")), ("equal sizes", start.get("equal")),
-                                     ("state filled", state.get("filled"))) if not ok]
+    """Whether the run began as the plan asks, and what was missing if not. A run of jobs without state
+    has no state block in meta.json and nothing to fill."""
+    start, state = m.get("start") or {}, m.get("state")
+    checks = [("drained", m.get("drained")), ("settled", m.get("settled")),
+              ("at the scenario's size", start.get("at_scenario_size")), ("equal sizes", start.get("equal"))]
+    if state is not None:
+        checks.append(("state filled", state.get("filled")))
+    missing = [name for name, ok in checks if not ok]
     return not missing, missing
+
+
+def state_sizes(m):
+    """(GiB of state the jobs are to hold, job -> GiB in its last completed checkpoint when the measured
+    phase began). Zeros for a run of jobs without state."""
+    state = m.get("state") or {}
+    wanted, held = state.get("wanted") or {}, state.get("bytes") or {}
+    return (max(wanted.values()) / 2**30 if wanted else 0.0), {j: (held.get(j) or 0) / 2**30 for j in m["jobs"]}
 
 
 def main():
@@ -153,8 +164,7 @@ def main():
             unready.append((rep, missing))
             continue
         names = pair(m["jobs"])
-        state = m["state"]
-        gib = max(state["wanted"].values()) / 2**30
+        gib, held = state_sizes(m)
         for job, v in h.items():
             x = dd.get(f"{scenario}/{rep}", {}).get(job)
             stops = down_stretches(os.path.join(d, "latency.csv"), job, m["duration"])
@@ -163,7 +173,7 @@ def main():
                      dd_measured=x[1] if x else float("nan"), late=late_seconds(os.path.join(d, "latency.csv"), job, m["duration"]),
                      down=sum(stops), stops=stops, quiet=down_seconds(os.path.join(d, "latency.csv"), job, m["duration"]),
                      emitted=emitted(os.path.join(d, "latency.csv"), job, m["duration"]) / 1000.0, sent=(m.get("records_sent") or 0) / 1000.0,
-                     state_gib=(state["bytes"].get(job) or 0) / 2**30)
+                     state_gib=held[job])
             rows.append(v)
     reps = sorted({r["rep"] for r in rows})
     left = (" (left out by --without: " + ", ".join(map(str, sorted(without))) + ")") if without else ""
